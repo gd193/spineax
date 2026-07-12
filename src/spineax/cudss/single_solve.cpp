@@ -135,9 +135,9 @@ struct CudssState {
     size_t owned_csr_values_bytes = 0;
 
     // cuDSS handle/data/descriptors are mutable and not documented as safe for
-    // concurrent solves. Only constant handlers take this lock; dynamic hot
-    // paths retain their existing lock-free behavior.
-    std::mutex constant_mutex;
+    // concurrent solves. Every invocation serializes host mutation and waits
+    // for the prior submitted stream before replacing descriptor pointers.
+    std::mutex invocation_mutex;
 
     void DestroyResources() noexcept {
         if (device_id >= 0) CUDA_LOG_IF_ERROR(cudaSetDevice(static_cast<int>(device_id)));
@@ -161,7 +161,7 @@ struct CudssState {
     }
 
     ~CudssState() {
-        std::lock_guard<std::mutex> lock(constant_mutex);
+        std::lock_guard<std::mutex> lock(invocation_mutex);
         DestroyResources();
     }
 };
@@ -253,11 +253,19 @@ static ffi::Error CudssExecute(
     const int64_t mview_id                  // {0: full, 1: triu, 2: tril}
 ) {
 
-    // Track stream for cleanup synchronization
+    std::lock_guard<std::mutex> invocation_lock(state->invocation_mutex);
+    CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
+    if (state->last_stream) CUDA_CHECK(cudaStreamSynchronize(state->last_stream));
     state->last_stream = stream;
+    const bool cold = state->call_count == 0;
+    struct ColdRollback {
+        CudssState<T>* state;
+        bool active;
+        ~ColdRollback() { if (active) state->DestroyResources(); }
+    } rollback{state, cold};
 
     // instantiate system branch
-    if (state->call_count == 0) {
+    if (cold) {
 
         // figure this out on first call
         state->n = offsets_buf.element_count() - 1;
@@ -285,13 +293,13 @@ static ffi::Error CudssExecute(
 
         // CuDSS config
         // iterative refinement of the soln is pretty n i f t y
-        int iter_ref_nsteps = cudss_ir_nsteps();
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
         {
             ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
             if (env_error.failure()) return env_error;
         }
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         // cold solve - analyze, factorize, solve
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
@@ -304,6 +312,7 @@ static ffi::Error CudssExecute(
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
 
         state->call_count++;
+        rollback.active = false;
     }
     else {
         // stream can change between calls!!!
@@ -367,11 +376,19 @@ static ffi::Error CudssExecuteXOnly(
     const int64_t mview_id
 ) {
 
-    // Track stream for cleanup synchronization
+    std::lock_guard<std::mutex> invocation_lock(state->invocation_mutex);
+    CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
+    if (state->last_stream) CUDA_CHECK(cudaStreamSynchronize(state->last_stream));
     state->last_stream = stream;
+    const bool cold = state->call_count == 0;
+    struct ColdRollback {
+        CudssState<T>* state;
+        bool active;
+        ~ColdRollback() { if (active) state->DestroyResources(); }
+    } rollback{state, cold};
 
     // instantiate system branch
-    if (state->call_count == 0) {
+    if (cold) {
 
         // figure this out on first call
         state->n = offsets_buf.element_count() - 1;
@@ -399,13 +416,13 @@ static ffi::Error CudssExecuteXOnly(
 
         // CuDSS config
         // iterative refinement of the soln is pretty n i f t y
-        int iter_ref_nsteps = cudss_ir_nsteps();
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
         {
             ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
             if (env_error.failure()) return env_error;
         }
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         // cold solve - analyze, factorize, solve
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
@@ -418,6 +435,7 @@ static ffi::Error CudssExecuteXOnly(
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
 
         state->call_count++;
+        rollback.active = false;
     }
     else {
         // stream can change between calls!!!
@@ -455,7 +473,7 @@ static ffi::Error CudssExecuteConstantXOnly(
     const int64_t mtype_id,
     const int64_t mview_id
 ) {
-    std::lock_guard<std::mutex> invocation_lock(state->constant_mutex);
+    std::lock_guard<std::mutex> invocation_lock(state->invocation_mutex);
     CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
     state->last_stream = stream;
     bool stream_completed = false;
@@ -510,13 +528,13 @@ static ffi::Error CudssExecuteConstantXOnly(
             CUDA_R_32I, state->cuda_dtype,
             state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
 
-        int iter_ref_nsteps = cudss_ir_nsteps();
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
         {
             ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
             if (env_error.failure()) return env_error;
         }
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
@@ -563,7 +581,7 @@ static ffi::Error CudssExecuteConstantMultiRHSXOnly(
     const int64_t mtype_id,
     const int64_t mview_id
 ) {
-    std::lock_guard<std::mutex> invocation_lock(state->constant_mutex);
+    std::lock_guard<std::mutex> invocation_lock(state->invocation_mutex);
     CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
     state->last_stream = stream;
     bool stream_completed = false;
@@ -617,13 +635,13 @@ static ffi::Error CudssExecuteConstantMultiRHSXOnly(
             CUDA_R_32I, state->cuda_dtype,
             state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
 
-        int iter_ref_nsteps = cudss_ir_nsteps();
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
         {
             ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
             if (env_error.failure()) return env_error;
         }
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");

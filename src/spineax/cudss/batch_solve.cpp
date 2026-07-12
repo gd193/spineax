@@ -4,6 +4,7 @@ batched outputs to support inertia retrieval*/
 #include <cstdlib>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <utility>
 // For debugging
@@ -110,6 +111,8 @@ struct CudssBatchState {
     cudssIndexBase_t base = CUDSS_BASE_ZERO;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
     cudaStream_t last_stream = nullptr; // track stream for synchronization
+    int64_t device_id = -1;
+    std::mutex invocation_mutex;
     int64_t n = 0;
     int64_t nnz = 0;
     int64_t nrhs = 0;
@@ -122,20 +125,23 @@ struct CudssBatchState {
     // this is literally only for debugging
     // using native_dtype = typename get_native_data_type<T>::type;
 
+    void DestroyResources() noexcept {
+        if (device_id >= 0) cudaSetDevice(static_cast<int>(device_id));
+        if (last_stream) cudaStreamSynchronize(last_stream);
+        if (A) { cudssMatrixDestroy(A); A = nullptr; }
+        if (b) { cudssMatrixDestroy(b); b = nullptr; }
+        if (x) { cudssMatrixDestroy(x); x = nullptr; }
+        if (handle && data) { cudssDataDestroy(handle, data); data = nullptr; }
+        if (config) { cudssConfigDestroy(config); config = nullptr; }
+        if (handle) { cudssDestroy(handle); handle = nullptr; }
+        cached_offsets_ptr = cached_columns_ptr = nullptr;
+        n = nnz = call_count = 0;
+        last_stream = nullptr;
+    }
+
     ~CudssBatchState() {
-        if (handle) {
-            // Synchronize with the last stream before destroying resources
-            if (last_stream) {
-                cudaStreamSynchronize(last_stream);
-            }
-            // CuDSS destruction
-            cudssMatrixDestroy(A);
-            cudssMatrixDestroy(b);
-            cudssMatrixDestroy(x);
-            cudssDataDestroy(handle, data);
-            cudssConfigDestroy(config);
-            cudssDestroy(handle);
-        }
+        std::lock_guard<std::mutex> lock(invocation_mutex);
+        DestroyResources();
     }
 };
 
@@ -194,14 +200,19 @@ static ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>> CudssInstantiate(
 
     // Store uniform dimensions and batch size
     state->nrhs = 1;
+    state->device_id = device_id;
 
     // Python ints are being passed as int64_t's
     state->ubatch_size = static_cast<int32_t>(batch_size_64);
 
-    // CUDA setup can happen here before any cudaMallocs
-    cudaSetDevice(device_id);
+    // CUDA setup can happen here before any cudaMallocs.
+    cudaError_t cuda_status = cudaSetDevice(static_cast<int>(device_id));
+    if (cuda_status != cudaSuccess) {
+        return ffi::Unexpected(ffi::Error::Internal(
+            std::string("cudaSetDevice failed: ") + cudaGetErrorString(cuda_status)));
+    }
 
-    return std::move(state); // simply return the created CudssBatchState
+    return state;
 }
 
 // execution ===================================================================
@@ -221,10 +232,18 @@ static ffi::Error CudssExecute(
     const int64_t mview_id                      // {0: full, 1: triu, 2: tril}
 ) {
     // printf("in execute \n");
-    // Track stream for cleanup synchronization
+    std::lock_guard<std::mutex> invocation_lock(state->invocation_mutex);
+    CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
+    if (state->last_stream) CUDA_CHECK(cudaStreamSynchronize(state->last_stream));
     state->last_stream = stream;
+    const bool cold = state->call_count == 0;
+    struct ColdRollback {
+        CudssBatchState<T>* state;
+        bool active;
+        ~ColdRollback() { if (active) state->DestroyResources(); }
+    } rollback{state, cold};
 
-    if (state->call_count == 0) {
+    if (cold) {
 
         // Figure out structure on first call
         state->n = offsets_buf.element_count() - 1;
@@ -258,13 +277,13 @@ static ffi::Error CudssExecute(
                        &state->ubatch_size, sizeof(state->ubatch_size)), state->status, "cudssConfigSet ubatch_size");
 
         // iterative refinement of the soln is pretty n i f t y
-        int iter_ref_nsteps = cudss_ir_nsteps();
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
         {
             ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
             if (env_error.failure()) return env_error;
         }
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         // cold solve - analyze, factorize, solve
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
@@ -290,6 +309,7 @@ static ffi::Error CudssExecute(
 
         // so we dont init again...
         state->call_count++;
+        rollback.active = false;
 
     } else {
         // stream can change between calls!!!
@@ -366,9 +386,18 @@ static ffi::Error CudssExecuteXOnly(
     const int64_t mtype_id,
     const int64_t mview_id
 ) {
+    std::lock_guard<std::mutex> invocation_lock(state->invocation_mutex);
+    CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
+    if (state->last_stream) CUDA_CHECK(cudaStreamSynchronize(state->last_stream));
     state->last_stream = stream;
+    const bool cold = state->call_count == 0;
+    struct ColdRollback {
+        CudssBatchState<T>* state;
+        bool active;
+        ~ColdRollback() { if (active) state->DestroyResources(); }
+    } rollback{state, cold};
 
-    if (state->call_count == 0) {
+    if (cold) {
         state->n = offsets_buf.element_count() - 1;
         state->nnz = columns_buf.element_count();
         CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
@@ -394,13 +423,13 @@ static ffi::Error CudssExecuteXOnly(
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_UBATCH_SIZE,
                        &state->ubatch_size, sizeof(state->ubatch_size)), state->status, "cudssConfigSet ubatch_size");
 
-        int iter_ref_nsteps = cudss_ir_nsteps();
-        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
-                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
         {
             ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
             if (env_error.failure()) return env_error;
         }
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
@@ -412,6 +441,7 @@ static ffi::Error CudssExecuteXOnly(
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
 
         state->call_count++;
+        rollback.active = false;
 
     } else {
         CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");

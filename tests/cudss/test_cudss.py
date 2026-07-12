@@ -1,3 +1,5 @@
+from concurrent.futures import ThreadPoolExecutor
+
 import jax
 import jax.numpy as jnp
 import jax.experimental.sparse as jsparse
@@ -162,3 +164,26 @@ def test_cudss_outputs():
     assert elimination_tree.shape == (1023,)
     assert nsuperpanels.shape == ()
     assert schur_shape.shape == (2,)
+
+
+def test_cudss_outputs_compiled_state_serializes_concurrent_calls():
+    _require_gpu()
+
+    M, b, _m, true_x = _base_system(jnp.float32)
+    lhs = jsparse.BCSR.fromdense(M)
+    solver = CuDSSSolverRE(lhs.indptr, lhs.indices, 0, 1, 1)
+
+    @jax.jit
+    def run(rhs, values):
+        return solver(rhs, values)[0]
+
+    run(b, lhs.data).block_until_ready()
+    scales = (0.5, 1.0, 2.0, 3.0)
+    with ThreadPoolExecutor(max_workers=len(scales)) as pool:
+        outputs = list(
+            pool.map(
+                lambda scale: run(b * scale, lhs.data).block_until_ready(), scales
+            )
+        )
+    for output, scale in zip(outputs, scales, strict=True):
+        assert jnp.allclose(output, true_x * scale, rtol=1e-5, atol=1e-5)

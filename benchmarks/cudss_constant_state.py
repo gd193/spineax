@@ -35,11 +35,15 @@ def main(iterations=50):
         "matrix_n": n,
         "iterations": iterations,
         "dynamic_cold_seconds": timed(dynamic_call, rhs, csr.data),
-        "dynamic_warm_seconds": timed(dynamic_call, rhs, csr.data, iterations=iterations),
+        "dynamic_warm_seconds": timed(
+            dynamic_call, rhs, csr.data, iterations=iterations
+        ),
         "constant_cold_seconds": timed(constant_call, rhs),
         "constant_warm_seconds": timed(constant_call, rhs, iterations=iterations),
     }
-    results["warm_speedup"] = results["dynamic_warm_seconds"] / results["constant_warm_seconds"]
+    results["warm_speedup"] = (
+        results["dynamic_warm_seconds"] / results["constant_warm_seconds"]
+    )
     print(json.dumps(results, indent=2, sort_keys=True))
 
 

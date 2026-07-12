@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <complex>
 #include <type_traits>
@@ -144,6 +145,8 @@ struct CudssState {
     cudssIndexBase_t base = CUDSS_BASE_ZERO;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
     cudaStream_t last_stream = nullptr; // track stream for synchronization
+    int64_t device_id = -1;
+    std::mutex invocation_mutex;
     int64_t n = 0;
     int64_t nnz = 0;
     int64_t nrhs = 0;
@@ -154,19 +157,22 @@ struct CudssState {
     // this is literally only for debugging
     using native_dtype = typename get_native_data_type<T>::type;
 
+    void DestroyResources() noexcept {
+        if (device_id >= 0) CUDA_LOG_IF_ERROR(cudaSetDevice(static_cast<int>(device_id)));
+        if (last_stream) CUDA_LOG_IF_ERROR(cudaStreamSynchronize(last_stream));
+        if (A) { cudssMatrixDestroy(A); A = nullptr; }
+        if (b) { cudssMatrixDestroy(b); b = nullptr; }
+        if (x) { cudssMatrixDestroy(x); x = nullptr; }
+        if (handle && data) { cudssDataDestroy(handle, data); data = nullptr; }
+        if (config) { cudssConfigDestroy(config); config = nullptr; }
+        if (handle) { cudssDestroy(handle); handle = nullptr; }
+        n = nnz = call_count = 0;
+        last_stream = nullptr;
+    }
+
     ~CudssState() {
-        if (handle) {
-            // Synchronize with the last stream before destroying resources
-            if (last_stream) {
-                cudaStreamSynchronize(last_stream);
-            }
-            cudssMatrixDestroy(A);
-            cudssMatrixDestroy(b);
-            cudssMatrixDestroy(x);
-            cudssDataDestroy(handle, data);
-            cudssConfigDestroy(config);
-            cudssDestroy(handle);
-        }
+        std::lock_guard<std::mutex> lock(invocation_mutex);
+        DestroyResources();
     }
 };
 
@@ -224,12 +230,18 @@ static ffi::ErrorOr<std::unique_ptr<CudssState<T>>> CudssInstantiate(
 
     // may as well store these for later for readability
 
+    state->device_id = device_id;
     state->nrhs = 1; // the non-batched case
 
-    // CUDA setup
-    cudaSetDevice(device_id);
+    // CUDA setup. Instantiation is transactional through unique_ptr.
+    cudaError_t cuda_status = cudaSetDevice(static_cast<int>(device_id));
+    if (cuda_status != cudaSuccess) {
+        return ffi::Unexpected(
+            ffi::Error::Internal(std::string("cudaSetDevice failed: ") +
+                                 cudaGetErrorString(cuda_status)));
+    }
 
-    return ffi::ErrorOr<std::unique_ptr<CudssState<T>>>(std::move(state));
+    return state;
 }
 
 // execution ===================================================================
@@ -261,11 +273,19 @@ static ffi::Error CudssExecute(
     const int64_t mview_id                      // {0: full, 1: triu, 2: tril}
 ) {
 
-    // Track stream for cleanup synchronization
+    std::lock_guard<std::mutex> invocation_lock(state->invocation_mutex);
+    CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
+    if (state->last_stream) CUDA_CHECK(cudaStreamSynchronize(state->last_stream));
     state->last_stream = stream;
+    const bool cold = state->call_count == 0;
+    struct ColdRollback {
+        CudssState<T>* state;
+        bool active;
+        ~ColdRollback() { if (active) state->DestroyResources(); }
+    } rollback{state, cold};
 
     // instantiate system branch
-    if (state->call_count == 0) {
+    if (cold) {
 
         // figure this out on first call
         state->n = offsets_buf.element_count() - 1;
@@ -308,6 +328,7 @@ static ffi::Error CudssExecute(
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
 
         state->call_count++;
+        rollback.active = false;
     }
     else {
         // printf("not first execute call\n");

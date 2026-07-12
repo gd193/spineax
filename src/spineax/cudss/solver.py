@@ -1,5 +1,6 @@
 import functools as ft
 import hashlib
+import numbers
 import os
 
 import jax
@@ -571,6 +572,8 @@ def _solve(
     ):
     if b_values.ndim < 1 or b_values.shape[-1] != csr_offsets.shape[0] - 1:
         raise ValueError("RHS trailing dimension must equal the CSR matrix dimension")
+    if not constant_values and b_values.ndim != 1:
+        raise ValueError("dynamic cuDSS direct solves require a one-dimensional RHS; use vmap for batching")
     if b_values.dtype != csr_values.dtype:
         raise TypeError("RHS and CSR values must have the same dtype")
     if constant_values and matrix_token is None:
@@ -775,6 +778,35 @@ def solve_single_c64_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
 def solve_single_c128_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
     return general_solve_vmap(vector_arg_values, batch_axes, return_diagnostics=False, **kwargs)
 
+def solve_multi_rhs_const_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
+    """Flatten another mapped RHS axis into the native multi-RHS solve."""
+    b_values, csr_values, csr_offsets, csr_columns = vector_arg_values
+    a_b, a_val, a_off, a_col = batch_axes
+    if a_off is not None:
+        csr_offsets = jax.lax.index_in_dim(csr_offsets, 0, axis=a_off, keepdims=False)
+        a_off = None
+    if a_col is not None:
+        csr_columns = jax.lax.index_in_dim(csr_columns, 0, axis=a_col, keepdims=False)
+        a_col = None
+    if a_val is not None or a_off is not None or a_col is not None:
+        raise NotImplementedError("constant_values cuDSS vmap supports only batched RHS with constant matrix")
+    if a_b is None:
+        return _const_xonly_solver_for_dtype(csr_values.dtype, multi_rhs=True).bind(
+            b_values, csr_values, csr_offsets, csr_columns, **kwargs
+        ), (None,)
+    if a_b != 0:
+        b_values = jnp.moveaxis(b_values, a_b, 0)
+    original_shape = b_values.shape
+    out = _const_xonly_solver_for_dtype(csr_values.dtype, multi_rhs=True).bind(
+        jnp.reshape(b_values, (-1,)),
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        **kwargs,
+    )[0]
+    return (jnp.reshape(out, original_shape),), (0,)
+
+
 def solve_single_const_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
     b_values, csr_values, csr_offsets, csr_columns = vector_arg_values
     a_b, a_val, a_off, a_col = batch_axes
@@ -902,6 +934,9 @@ for _suffix in _DTYPE_BY_SUFFIX:
     batching.primitive_batchers[
         _const_xonly_solver_for_dtype(_DTYPE_BY_SUFFIX[_suffix], multi_rhs=False)
     ] = solve_single_const_xonly_vmap
+    batching.primitive_batchers[
+        _const_xonly_solver_for_dtype(_DTYPE_BY_SUFFIX[_suffix], multi_rhs=True)
+    ] = solve_multi_rhs_const_xonly_vmap
 
 # vmap of vmap
 def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
@@ -1028,13 +1063,26 @@ def _validate_solver_configuration(csr_offsets, csr_columns, device_id, mtype_id
         raise ValueError("final CSR offset must equal the number of columns/values")
     if np.any(columns < 0) or np.any(columns >= n):
         raise ValueError("CSR column indices are outside the square matrix")
-    if not isinstance(device_id, (int, np.integer)) or int(device_id) < 0:
-        raise ValueError("device_id must be a nonnegative integer")
-    if int(mtype_id) not in range(5):
-        raise ValueError("mtype_id must be in [0, 4]")
-    if int(mview_id) not in range(3):
-        raise ValueError("mview_id must be in [0, 2]")
+    ids = {
+        "device_id": (device_id, range(0, 2**63)),
+        "mtype_id": (mtype_id, range(5)),
+        "mview_id": (mview_id, range(3)),
+    }
+    for name, (value, valid) in ids.items():
+        if isinstance(value, (bool, np.bool_)) or not isinstance(value, numbers.Integral):
+            raise TypeError(f"{name} must be a non-boolean integer")
+        if int(value) not in valid:
+            if name == "device_id":
+                raise ValueError("device_id must be a nonnegative integer")
+            upper = 4 if name == "mtype_id" else 2
+            raise ValueError(f"{name} must be in [0, {upper}]")
     return n, columns.size
+
+
+def _validate_return_diagnostics(return_diagnostics):
+    if not isinstance(return_diagnostics, (bool, np.bool_)):
+        raise TypeError("return_diagnostics must be a boolean")
+    return bool(return_diagnostics)
 
 
 def _validate_values_and_rhs(csr_values, b, n, nnz):
@@ -1080,13 +1128,18 @@ class CuDSSSolver(eqx.Module):
         )
         self.csr_offsets = csr_offsets
         self.csr_columns = csr_columns
-        self.device_id = int(device_id)
-        self.mtype_id = mtype_id
-        self.mview_id = mview_id
-        self.return_diagnostics = bool(return_diagnostics)
+        try:
+            self.device_id = int(device_id)
+            self.mtype_id = int(mtype_id)
+            self.mview_id = int(mview_id)
+        except (TypeError, ValueError, OverflowError) as error:  # validated above; defensive normalization
+            raise TypeError("cuDSS IDs must be representable as Python integers") from error
+        self.return_diagnostics = _validate_return_diagnostics(return_diagnostics)
 
     def __call__(self, b, csr_values):
         _validate_values_and_rhs(csr_values, b, self._n, self._nnz)
+        if b.ndim != 1:
+            raise ValueError("dynamic cuDSS direct solves require a one-dimensional RHS; use vmap for batching")
         return solve(
             b,
             csr_values,
@@ -1112,7 +1165,8 @@ class ConstantCSRCuDSSSolver(eqx.Module):
 
     csr_offsets: Array = eqx.field(static=True)
     csr_columns: Array = eqx.field(static=True)
-    csr_values: Array
+    _csr_values_bytes: bytes = eqx.field(static=True)
+    _csr_values_dtype: str = eqx.field(static=True)
     matrix_token: str = eqx.field(static=True)
     _n: int = eqx.field(static=True)
     _nnz: int = eqx.field(static=True)
@@ -1144,21 +1198,33 @@ class ConstantCSRCuDSSSolver(eqx.Module):
             digest.update(array.tobytes())
         self.csr_offsets = csr_offsets
         self.csr_columns = csr_columns
-        self.csr_values = jnp.asarray(csr_values)
+        self._csr_values_bytes = values_host.tobytes()
+        self._csr_values_dtype = values_host.dtype.str
         self.matrix_token = digest.hexdigest()
         self._n = n
         self._nnz = nnz
-        self.device_id = int(device_id)
-        self.mtype_id = mtype_id
-        self.mview_id = mview_id
+        try:
+            self.device_id = int(device_id)
+            self.mtype_id = int(mtype_id)
+            self.mview_id = int(mview_id)
+        except (TypeError, ValueError, OverflowError) as error:  # validated above; defensive normalization
+            raise TypeError("cuDSS IDs must be representable as Python integers") from error
+
+    @property
+    def csr_values(self):
+        """The fixed values reconstructed from immutable, hashable metadata."""
+        return jnp.asarray(
+            np.frombuffer(self._csr_values_bytes, dtype=np.dtype(self._csr_values_dtype))
+        )
 
     def __call__(self, b):
-        _validate_values_and_rhs(self.csr_values, b, self._n, self._nnz)
+        csr_values = self.csr_values
+        _validate_values_and_rhs(csr_values, b, self._n, self._nnz)
         if b.ndim not in (1, 2):
             raise ValueError("constant cuDSS supports one or multiple RHS vectors")
         return _solve(
             b,
-            self.csr_values,
+            csr_values,
             csr_offsets=self.csr_offsets,
             csr_columns=self.csr_columns,
             device_id=self.device_id,
