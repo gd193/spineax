@@ -3,6 +3,7 @@
 #include <cstdlib>
 #include <cstdint>
 #include <memory>
+#include <mutex>
 #include <vector>
 #include <complex>
 #include <type_traits>
@@ -117,32 +118,51 @@ struct CudssState {
     cudssMatrixViewType_t mview = CUDSS_MVIEW_UPPER;
     cudssIndexBase_t base = CUDSS_BASE_ZERO;
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
-    cudaStream_t last_stream = nullptr; // track stream for synchronization
+    cudaStream_t last_stream = nullptr;
+    int64_t device_id = -1;
     int64_t n = 0;
     int64_t nnz = 0;
     int64_t nrhs = 0;
-    int64_t call_count = 0; // necessary for detecting if we need further instantiation in execution stage
+    int64_t call_count = 0;
     size_t sizeWritten = 0;
     cudaDataType cuda_dtype = get_cuda_data_type<T>();
     using native_dtype = typename get_native_data_type<T>::type;
+    int32_t* owned_csr_offsets = nullptr;
+    int32_t* owned_csr_columns = nullptr;
     native_dtype* owned_csr_values = nullptr;
+    size_t owned_csr_offsets_bytes = 0;
+    size_t owned_csr_columns_bytes = 0;
     size_t owned_csr_values_bytes = 0;
 
+    // cuDSS handle/data/descriptors are mutable and not documented as safe for
+    // concurrent solves. Only constant handlers take this lock; dynamic hot
+    // paths retain their existing lock-free behavior.
+    std::mutex constant_mutex;
+
+    void DestroyResources() noexcept {
+        if (device_id >= 0) CUDA_LOG_IF_ERROR(cudaSetDevice(static_cast<int>(device_id)));
+        if (last_stream) CUDA_LOG_IF_ERROR(cudaStreamSynchronize(last_stream));
+
+        // Descriptors retain matrix pointers, so destroy them before buffers.
+        if (A) { cudssMatrixDestroy(A); A = nullptr; }
+        if (b) { cudssMatrixDestroy(b); b = nullptr; }
+        if (x) { cudssMatrixDestroy(x); x = nullptr; }
+        if (handle && data) { cudssDataDestroy(handle, data); data = nullptr; }
+        if (config) { cudssConfigDestroy(config); config = nullptr; }
+        if (handle) { cudssDestroy(handle); handle = nullptr; }
+        if (owned_csr_offsets) { CUDA_LOG_IF_ERROR(cudaFree(owned_csr_offsets)); owned_csr_offsets = nullptr; }
+        if (owned_csr_columns) { CUDA_LOG_IF_ERROR(cudaFree(owned_csr_columns)); owned_csr_columns = nullptr; }
+        if (owned_csr_values) { CUDA_LOG_IF_ERROR(cudaFree(owned_csr_values)); owned_csr_values = nullptr; }
+        owned_csr_offsets_bytes = owned_csr_columns_bytes = owned_csr_values_bytes = 0;
+        n = nnz = 0;
+        nrhs = 1;
+        call_count = 0;
+        last_stream = nullptr;
+    }
+
     ~CudssState() {
-        if (last_stream) {
-            cudaStreamSynchronize(last_stream);
-        }
-        if (owned_csr_values) {
-            cudaFree(owned_csr_values);
-        }
-        if (handle) {
-            cudssMatrixDestroy(A);
-            cudssMatrixDestroy(b);
-            cudssMatrixDestroy(x);
-            cudssDataDestroy(handle, data);
-            cudssConfigDestroy(config);
-            cudssDestroy(handle);
-        }
+        std::lock_guard<std::mutex> lock(constant_mutex);
+        DestroyResources();
     }
 };
 
@@ -203,13 +223,18 @@ static ffi::ErrorOr<std::unique_ptr<CudssState<T>>> CudssInstantiate(
     }
 
     // may as well store these for later for readability
-
+    state->device_id = device_id;
     state->nrhs = 1; // the non-batched case
 
-    // CUDA setup
-    cudaSetDevice(device_id);
+    // CUDA setup. Instantiation is transactional through unique_ptr.
+    cudaError_t cuda_status = cudaSetDevice(static_cast<int>(device_id));
+    if (cuda_status != cudaSuccess) {
+        return ffi::Unexpected(
+            ffi::Error::Internal(std::string("cudaSetDevice failed: ") +
+                                 cudaGetErrorString(cuda_status)));
+    }
 
-    return ffi::ErrorOr<std::unique_ptr<CudssState<T>>>(std::move(state));
+    return state;
 }
 
 // execution ===================================================================
@@ -430,23 +455,44 @@ static ffi::Error CudssExecuteConstantXOnly(
     const int64_t mtype_id,
     const int64_t mview_id
 ) {
+    std::lock_guard<std::mutex> invocation_lock(state->constant_mutex);
+    CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
     state->last_stream = stream;
+    bool stream_completed = false;
+    struct StreamCompletionGuard {
+        cudaStream_t stream;
+        bool& completed;
+        ~StreamCompletionGuard() { if (!completed && stream) cudaStreamSynchronize(stream); }
+    } completion_guard{stream, stream_completed};
 
-    if (state->call_count == 0) {
-        state->n = offsets_buf.element_count() - 1;
-        state->nnz = columns_buf.element_count();
+    const int64_t n = offsets_buf.element_count() - 1;
+    const int64_t nnz = columns_buf.element_count();
+    if (n <= 0 || b_values_buf.element_count() != n ||
+        csr_values_buf.element_count() != nnz ||
+        offsets_buf.element_count() != n + 1) {
+        return ffi::Error::Internal("invalid constant single-RHS CSR/RHS dimensions");
+    }
+
+    const bool cold = state->call_count == 0;
+    struct ColdRollback {
+        CudssState<T>* state;
+        bool active;
+        ~ColdRollback() { if (active) state->DestroyResources(); }
+    } rollback{state, cold};
+
+    if (cold) {
+        state->n = n;
+        state->nnz = nnz;
         state->nrhs = 1;
-        state->owned_csr_values_bytes = state->nnz * sizeof(typename CudssState<T>::native_dtype);
-        CUDA_CHECK(cudaMallocAsync(
-            reinterpret_cast<void**>(&state->owned_csr_values),
-            state->owned_csr_values_bytes,
-            stream));
-        CUDA_CHECK(cudaMemcpyAsync(
-            state->owned_csr_values,
-            csr_values_buf.typed_data(),
-            state->owned_csr_values_bytes,
-            cudaMemcpyDeviceToDevice,
-            stream));
+        state->owned_csr_offsets_bytes = (n + 1) * sizeof(int32_t);
+        state->owned_csr_columns_bytes = nnz * sizeof(int32_t);
+        state->owned_csr_values_bytes = nnz * sizeof(typename CudssState<T>::native_dtype);
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&state->owned_csr_offsets), state->owned_csr_offsets_bytes, stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&state->owned_csr_columns), state->owned_csr_columns_bytes, stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&state->owned_csr_values), state->owned_csr_values_bytes, stream));
+        CUDA_CHECK(cudaMemcpyAsync(state->owned_csr_offsets, offsets_buf.typed_data(), state->owned_csr_offsets_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(state->owned_csr_columns, columns_buf.typed_data(), state->owned_csr_columns_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(state->owned_csr_values, csr_values_buf.typed_data(), state->owned_csr_values_bytes, cudaMemcpyDeviceToDevice, stream));
 
         CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
         CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
@@ -458,8 +504,8 @@ static ffi::Error CudssExecuteConstantXOnly(
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, state->n, state->nrhs, state->n,
             out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, state->n, state->n, state->nnz,
-            offsets_buf.typed_data(), NULL,
-            columns_buf.typed_data(),
+            state->owned_csr_offsets, NULL,
+            state->owned_csr_columns,
             state->owned_csr_values,
             CUDA_R_32I, state->cuda_dtype,
             state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
@@ -467,7 +513,10 @@ static ffi::Error CudssExecuteConstantXOnly(
         int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
-        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
+        {
+            ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
+            if (env_error.failure()) return env_error;
+        }
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
@@ -476,24 +525,20 @@ static ffi::Error CudssExecuteConstantXOnly(
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
         state->call_count++;
-        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
-            printf("constant xonly cudss: factorized once\n");
-        }
+        rollback.active = false;
     } else {
+        if (state->n != n || state->nnz != nnz || state->nrhs != 1) {
+            return ffi::Error::Internal("constant single-RHS cuDSS state called with changed shape");
+        }
         CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
-        CUDSS_CALL_AND_CHECK(cudssMatrixSetCsrPointers(state->A,
-            offsets_buf.typed_data(), NULL,
-            columns_buf.typed_data(),
-            state->owned_csr_values), state->status, "update_pointers A");
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
-        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
-            printf("constant xonly cudss: solve-only warm call\n");
-        }
     }
 
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    stream_completed = true;
     return ffi::Error::Success();
 }
 
@@ -518,29 +563,43 @@ static ffi::Error CudssExecuteConstantMultiRHSXOnly(
     const int64_t mtype_id,
     const int64_t mview_id
 ) {
+    std::lock_guard<std::mutex> invocation_lock(state->constant_mutex);
+    CUDA_CHECK(cudaSetDevice(static_cast<int>(state->device_id)));
     state->last_stream = stream;
+    bool stream_completed = false;
+    struct StreamCompletionGuard {
+        cudaStream_t stream;
+        bool& completed;
+        ~StreamCompletionGuard() { if (!completed && stream) cudaStreamSynchronize(stream); }
+    } completion_guard{stream, stream_completed};
 
     const int64_t n = offsets_buf.element_count() - 1;
-    if (n <= 0 || b_values_buf.element_count() % n != 0) {
-        return ffi::Error::Internal("constant multi-RHS cuDSS expected RHS shape (nrhs, n)");
+    const int64_t nnz = columns_buf.element_count();
+    if (n <= 0 || b_values_buf.element_count() % n != 0 ||
+        csr_values_buf.element_count() != nnz) {
+        return ffi::Error::Internal("invalid constant multi-RHS CSR/RHS dimensions");
     }
     const int64_t nrhs = b_values_buf.element_count() / n;
+    const bool cold = state->call_count == 0;
+    struct ColdRollback {
+        CudssState<T>* state;
+        bool active;
+        ~ColdRollback() { if (active) state->DestroyResources(); }
+    } rollback{state, cold};
 
-    if (state->call_count == 0) {
+    if (cold) {
         state->n = n;
-        state->nnz = columns_buf.element_count();
+        state->nnz = nnz;
         state->nrhs = nrhs;
-        state->owned_csr_values_bytes = state->nnz * sizeof(typename CudssState<T>::native_dtype);
-        CUDA_CHECK(cudaMallocAsync(
-            reinterpret_cast<void**>(&state->owned_csr_values),
-            state->owned_csr_values_bytes,
-            stream));
-        CUDA_CHECK(cudaMemcpyAsync(
-            state->owned_csr_values,
-            csr_values_buf.typed_data(),
-            state->owned_csr_values_bytes,
-            cudaMemcpyDeviceToDevice,
-            stream));
+        state->owned_csr_offsets_bytes = (n + 1) * sizeof(int32_t);
+        state->owned_csr_columns_bytes = nnz * sizeof(int32_t);
+        state->owned_csr_values_bytes = nnz * sizeof(typename CudssState<T>::native_dtype);
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&state->owned_csr_offsets), state->owned_csr_offsets_bytes, stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&state->owned_csr_columns), state->owned_csr_columns_bytes, stream));
+        CUDA_CHECK(cudaMallocAsync(reinterpret_cast<void**>(&state->owned_csr_values), state->owned_csr_values_bytes, stream));
+        CUDA_CHECK(cudaMemcpyAsync(state->owned_csr_offsets, offsets_buf.typed_data(), state->owned_csr_offsets_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(state->owned_csr_columns, columns_buf.typed_data(), state->owned_csr_columns_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(state->owned_csr_values, csr_values_buf.typed_data(), state->owned_csr_values_bytes, cudaMemcpyDeviceToDevice, stream));
 
         CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
         CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
@@ -552,8 +611,8 @@ static ffi::Error CudssExecuteConstantMultiRHSXOnly(
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, state->n, state->nrhs, state->n,
             out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for multi-RHS x");
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, state->n, state->n, state->nnz,
-            offsets_buf.typed_data(), NULL,
-            columns_buf.typed_data(),
+            state->owned_csr_offsets, NULL,
+            state->owned_csr_columns,
             state->owned_csr_values,
             CUDA_R_32I, state->cuda_dtype,
             state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
@@ -561,7 +620,10 @@ static ffi::Error CudssExecuteConstantMultiRHSXOnly(
         int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
-        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
+        {
+            ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
+            if (env_error.failure()) return env_error;
+        }
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
@@ -570,27 +632,20 @@ static ffi::Error CudssExecuteConstantMultiRHSXOnly(
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
         state->call_count++;
-        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
-            printf("constant multi-RHS xonly cudss: factorized once with nrhs=%ld\n", static_cast<long>(state->nrhs));
-        }
+        rollback.active = false;
     } else {
-        if (state->n != n || state->nrhs != nrhs) {
-            return ffi::Error::Internal("constant multi-RHS cuDSS compiled state called with changed shape");
+        if (state->n != n || state->nnz != nnz || state->nrhs != nrhs) {
+            return ffi::Error::Internal("constant multi-RHS cuDSS state called with changed shape");
         }
         CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
-        CUDSS_CALL_AND_CHECK(cudssMatrixSetCsrPointers(state->A,
-            offsets_buf.typed_data(), NULL,
-            columns_buf.typed_data(),
-            state->owned_csr_values), state->status, "update_pointers A");
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
-        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
-            printf("constant multi-RHS xonly cudss: solve-only warm call with nrhs=%ld\n", static_cast<long>(state->nrhs));
-        }
     }
 
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    stream_completed = true;
     return ffi::Error::Success();
 }
 

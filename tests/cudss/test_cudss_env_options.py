@@ -23,6 +23,7 @@ def get_test_system():
 
 
 CUDSS_ENV_NAMES = (
+    "SPINEAX_CUDSS_IR_N_STEPS",
     "SPINEAX_CUDSS_REORDERING_ALG",
     "SPINEAX_CUDSS_FACTORIZATION_ALG",
     "SPINEAX_CUDSS_DETERMINISTIC_MODE",
@@ -66,6 +67,8 @@ def solve_vmap_once(*, use_pbatch):
 @pytest.mark.parametrize(
     ("env_name", "env_value"),
     [
+        ("SPINEAX_CUDSS_IR_N_STEPS", "invalid"),
+        ("SPINEAX_CUDSS_IR_N_STEPS", "-1"),
         ("SPINEAX_CUDSS_REORDERING_ALG", "bogus"),
         ("SPINEAX_CUDSS_REORDERING_ALG", "6"),
         ("SPINEAX_CUDSS_FACTORIZATION_ALG", "alg_9"),

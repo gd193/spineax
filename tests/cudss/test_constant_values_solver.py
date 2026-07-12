@@ -1,3 +1,6 @@
+from concurrent.futures import ThreadPoolExecutor
+
+import equinox as eqx
 import pytest
 import jax
 import jax.experimental.sparse as jsparse
@@ -172,6 +175,74 @@ def test_constant_values_solution_only_vmap_rhs():
     assert jnp.allclose(x[0], true_x, atol=1e-5)
     assert jnp.allclose(x[1], true_x * 2.0, atol=2e-5)
     assert jnp.allclose(x[2], true_x * 0.5, atol=1e-5)
+
+
+def test_constant_solver_rejects_malformed_rhs_before_native_call():
+    solver, b, _ = make_constant_solver()
+    with pytest.raises(ValueError, match="RHS trailing dimension"):
+        solver(b[:-1])
+    with pytest.raises(ValueError, match="RHS trailing dimension"):
+        solver(jnp.ones((3, b.size - 1), dtype=b.dtype))
+
+
+def test_dynamic_solver_rejects_malformed_rhs_before_native_call():
+    from spineax.cudss.solver import CuDSSSolver
+
+    offsets, columns, values, b, _ = get_test_system()
+    solver = CuDSSSolver(offsets, columns, 0, 3, 0, return_diagnostics=False)
+    with pytest.raises(ValueError, match="RHS trailing dimension"):
+        solver(b[:-1], values)
+
+
+def test_same_shape_constant_matrices_do_not_alias_compiled_state():
+    offsets, columns, values, b, _ = get_test_system()
+    from spineax.cudss.solver import ConstantCSRCuDSSSolver
+
+    other_values = values.at[0].set(values[0] + 2.0)
+    first = ConstantCSRCuDSSSolver(offsets, columns, values, 0, 3, 0)
+    second = ConstantCSRCuDSSSolver(offsets, columns, other_values, 0, 3, 0)
+
+    @eqx.filter_jit
+    def run(solver, rhs):
+        return solver(rhs)[0]
+
+    x_first = run(first, b)
+    x_second = run(second, b)
+    dense_first = jsparse.BCSR((values, columns, offsets), shape=(b.size, b.size)).todense()
+    dense_second = jsparse.BCSR((other_values, columns, offsets), shape=(b.size, b.size)).todense()
+    assert first.matrix_token != second.matrix_token
+    assert jnp.allclose(x_first, jnp.linalg.solve(dense_first, b), atol=1e-5)
+    assert jnp.allclose(x_second, jnp.linalg.solve(dense_second, b), atol=1e-5)
+    assert not jnp.allclose(x_first, x_second)
+
+
+def test_constant_compiled_state_serializes_concurrent_calls():
+    solver, b, true_x = make_constant_solver()
+
+    @jax.jit
+    def run(rhs):
+        return solver(rhs)[0]
+
+    run(b).block_until_ready()
+    scales = (0.5, 1.0, 2.0, 3.0)
+    with ThreadPoolExecutor(max_workers=len(scales)) as pool:
+        outputs = list(pool.map(lambda scale: run(b * scale).block_until_ready(), scales))
+    for scale, output in zip(scales, outputs):
+        assert jnp.allclose(output, true_x * scale, atol=3e-5)
+
+
+def test_constant_initialization_failure_can_retry(monkeypatch):
+    solver, b, true_x = make_constant_solver()
+
+    @jax.jit
+    def run(rhs):
+        return solver(rhs)[0]
+
+    monkeypatch.setenv("SPINEAX_CUDSS_IR_N_STEPS", "invalid")
+    with pytest.raises(Exception, match="SPINEAX_CUDSS_IR_N_STEPS"):
+        run(b).block_until_ready()
+    monkeypatch.delenv("SPINEAX_CUDSS_IR_N_STEPS")
+    assert jnp.allclose(run(b), true_x, atol=1e-5)
 
 
 def test_constant_values_solution_only_f64_when_enabled():

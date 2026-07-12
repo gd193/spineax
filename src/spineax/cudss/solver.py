@@ -1,4 +1,5 @@
 import functools as ft
+import hashlib
 import os
 
 import jax
@@ -6,8 +7,8 @@ import jax.core
 import jax.extend.core
 from jax.interpreters import mlir, batching
 import jax.numpy as jnp
-from jaxtyping import Array
 import numpy as np
+from jaxtyping import Array
 import equinox as eqx
 
 
@@ -398,6 +399,9 @@ for _kind in (KIND_SINGLE_CONST, KIND_MULTI_RHS_CONST):
     for _suffix in _DTYPE_BY_SUFFIX:
         _name = _primitive_name(_kind, _suffix, return_diagnostics=False)
         def _const_impl(*args, _name=_name, **kwargs):
+            # This immutable fingerprint is a primitive cache key only. Native
+            # code receives and owns a snapshot of all CSR buffers.
+            kwargs.pop("matrix_token")
             return general_single_solve_xonly_impl(_name, *args, **kwargs)
         _PRIMITIVES[_name].def_impl(_const_impl)
 
@@ -486,7 +490,8 @@ def solve_xonly_aval(
         csr_columns,
         device_id,
         mtype_id,
-        mview_id
+        mview_id,
+        matrix_token=None,
     ):
     return [jax.core.ShapedArray(b_values.shape, b_values.dtype)]
 
@@ -549,6 +554,7 @@ for _kind in (KIND_SINGLE_CONST, KIND_MULTI_RHS_CONST):
         "mview_id",
         "return_diagnostics",
         "constant_values",
+        "matrix_token",
     ]
 )
 def _solve(
@@ -561,7 +567,14 @@ def _solve(
         mview_id,
         return_diagnostics=True,
         constant_values=False,
+        matrix_token=None,
     ):
+    if b_values.ndim < 1 or b_values.shape[-1] != csr_offsets.shape[0] - 1:
+        raise ValueError("RHS trailing dimension must equal the CSR matrix dimension")
+    if b_values.dtype != csr_values.dtype:
+        raise TypeError("RHS and CSR values must have the same dtype")
+    if constant_values and matrix_token is None:
+        raise ValueError("constant cuDSS solve requires an immutable matrix token")
     if constant_values and return_diagnostics:
         raise ValueError("constant_values=True requires return_diagnostics=False")
     if constant_values:
@@ -583,6 +596,7 @@ def _solve(
                     device_id=device_id,
                     mtype_id=mtype_id,
                     mview_id=mview_id,
+                    matrix_token=matrix_token,
                 )[0]
                 return [jnp.reshape(out, b_values.shape)]
             # Pass a flattened contiguous row-major [batch, n] buffer to C++.
@@ -599,6 +613,7 @@ def _solve(
                 device_id=device_id,
                 mtype_id=mtype_id,
                 mview_id=mview_id,
+                matrix_token=matrix_token,
             )[0]
             return [jnp.reshape(out, b_values.shape)]
         solver = _const_xonly_solver_for_dtype(csr_values.dtype, multi_rhs=False)
@@ -618,6 +633,7 @@ def _solve(
         device_id = device_id, 
         mtype_id = mtype_id,
         mview_id = mview_id,
+        **({"matrix_token": matrix_token} if constant_values else {}),
     )
 
 
@@ -670,6 +686,12 @@ def batch_solve(
         mview_id,
         return_diagnostics=True
     ):
+    if b_values.ndim != 2 or b_values.shape[-1] != csr_offsets.shape[-1] - 1:
+        raise ValueError("RHS trailing dimension must equal the CSR matrix dimension")
+    if csr_values.ndim != 2 or csr_values.shape[0] != batch_size:
+        raise ValueError("batched CSR values must have shape (batch_size, nnz)")
+    if b_values.shape[0] != batch_size or b_values.dtype != csr_values.dtype:
+        raise ValueError("RHS batch size and dtype must match CSR values")
     _log_dtype(csr_values.dtype)
     solver = _primitive_for(
         KIND_BATCH,
@@ -710,6 +732,12 @@ def pbatch_solve(
         mview_id,
         return_diagnostics=True
     ):
+    if b_values.ndim != 2 or b_values.shape[-1] != csr_offsets.shape[-1] - 1:
+        raise ValueError("RHS trailing dimension must equal the CSR matrix dimension")
+    if csr_values.ndim != 2 or csr_values.shape[0] != batch_size:
+        raise ValueError("pseudo-batched CSR values must have shape (batch_size, nnz)")
+    if b_values.shape[0] != batch_size or b_values.dtype != csr_values.dtype:
+        raise ValueError("RHS batch size and dtype must match CSR values")
     _log_dtype(csr_values.dtype)
     solver = _primitive_for(
         KIND_PBATCH,
@@ -986,6 +1014,39 @@ for _kind in (KIND_BATCH, KIND_PBATCH):
         ] = solve_batch_xonly_vmap
 
 # create python side composable class to ensure validity of the columns and offsets
+def _validate_solver_configuration(csr_offsets, csr_columns, device_id, mtype_id, mview_id):
+    offsets = np.asarray(jax.device_get(csr_offsets))
+    columns = np.asarray(jax.device_get(csr_columns))
+    if offsets.ndim != 1 or columns.ndim != 1:
+        raise ValueError("CSR offsets and columns must be one-dimensional")
+    if offsets.dtype != np.int32 or columns.dtype != np.int32:
+        raise TypeError("cuDSS CSR offsets and columns must use int32")
+    if offsets.size < 2 or offsets[0] != 0 or np.any(offsets[1:] < offsets[:-1]):
+        raise ValueError("CSR offsets must start at zero and be nondecreasing")
+    n = offsets.size - 1
+    if offsets[-1] != columns.size:
+        raise ValueError("final CSR offset must equal the number of columns/values")
+    if np.any(columns < 0) or np.any(columns >= n):
+        raise ValueError("CSR column indices are outside the square matrix")
+    if not isinstance(device_id, (int, np.integer)) or int(device_id) < 0:
+        raise ValueError("device_id must be a nonnegative integer")
+    if int(mtype_id) not in range(5):
+        raise ValueError("mtype_id must be in [0, 4]")
+    if int(mview_id) not in range(3):
+        raise ValueError("mview_id must be in [0, 2]")
+    return n, columns.size
+
+
+def _validate_values_and_rhs(csr_values, b, n, nnz):
+    if csr_values.ndim != 1 or csr_values.shape[0] != nnz:
+        raise ValueError("CSR values must be one-dimensional with one value per column index")
+    _dtype_suffix(csr_values.dtype)
+    if b.ndim < 1 or b.shape[-1] != n:
+        raise ValueError("RHS trailing dimension must equal the CSR matrix dimension")
+    if b.dtype != csr_values.dtype:
+        raise TypeError("RHS and CSR values must have the same dtype")
+
+
 class CuDSSSolver(eqx.Module):
     """Sparse linear solver wrapper with dynamic CSR values.
 
@@ -1002,6 +1063,8 @@ class CuDSSSolver(eqx.Module):
     mtype_id: int = eqx.field(static=True)
     mview_id: int = eqx.field(static=True)
     return_diagnostics: bool = eqx.field(static=True)
+    _n: int = eqx.field(static=True)
+    _nnz: int = eqx.field(static=True)
 
     def __init__(
         self,
@@ -1012,14 +1075,18 @@ class CuDSSSolver(eqx.Module):
         mview_id,
         return_diagnostics: bool = True,
     ):
+        self._n, self._nnz = _validate_solver_configuration(
+            csr_offsets, csr_columns, device_id, mtype_id, mview_id
+        )
         self.csr_offsets = csr_offsets
         self.csr_columns = csr_columns
-        self.device_id = device_id
+        self.device_id = int(device_id)
         self.mtype_id = mtype_id
         self.mview_id = mview_id
         self.return_diagnostics = bool(return_diagnostics)
 
     def __call__(self, b, csr_values):
+        _validate_values_and_rhs(csr_values, b, self._n, self._nnz)
         return solve(
             b,
             csr_values,
@@ -1046,6 +1113,9 @@ class ConstantCSRCuDSSSolver(eqx.Module):
     csr_offsets: Array = eqx.field(static=True)
     csr_columns: Array = eqx.field(static=True)
     csr_values: Array
+    matrix_token: str = eqx.field(static=True)
+    _n: int = eqx.field(static=True)
+    _nnz: int = eqx.field(static=True)
     device_id: int = eqx.field(static=True)
     mtype_id: int = eqx.field(static=True)
     mview_id: int = eqx.field(static=True)
@@ -1059,14 +1129,33 @@ class ConstantCSRCuDSSSolver(eqx.Module):
         mtype_id,
         mview_id,
     ):
+        n, nnz = _validate_solver_configuration(
+            csr_offsets, csr_columns, device_id, mtype_id, mview_id
+        )
+        values_host = np.asarray(jax.device_get(csr_values))
+        if values_host.ndim != 1 or values_host.size != nnz:
+            raise ValueError("CSR values must be one-dimensional and match column indices")
+        _dtype_suffix(values_host.dtype)
+        digest = hashlib.sha256()
+        for array in (np.asarray(jax.device_get(csr_offsets)),
+                      np.asarray(jax.device_get(csr_columns)), values_host):
+            digest.update(array.dtype.str.encode())
+            digest.update(np.asarray(array.shape, dtype=np.int64).tobytes())
+            digest.update(array.tobytes())
         self.csr_offsets = csr_offsets
         self.csr_columns = csr_columns
-        self.csr_values = csr_values
-        self.device_id = device_id
+        self.csr_values = jnp.asarray(csr_values)
+        self.matrix_token = digest.hexdigest()
+        self._n = n
+        self._nnz = nnz
+        self.device_id = int(device_id)
         self.mtype_id = mtype_id
         self.mview_id = mview_id
 
     def __call__(self, b):
+        _validate_values_and_rhs(self.csr_values, b, self._n, self._nnz)
+        if b.ndim not in (1, 2):
+            raise ValueError("constant cuDSS supports one or multiple RHS vectors")
         return _solve(
             b,
             self.csr_values,
@@ -1077,4 +1166,5 @@ class ConstantCSRCuDSSSolver(eqx.Module):
             mview_id=self.mview_id,
             return_diagnostics=False,
             constant_values=True,
+            matrix_token=self.matrix_token,
         )

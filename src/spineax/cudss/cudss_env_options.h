@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <cstdlib>
+#include <limits>
 #include <string>
 
 #include "cudss.h"
@@ -98,6 +99,18 @@ static CudssEnvBoolOption cudss_parse_bool_env(const char* name) {
 
 static xla::ffi::Error cudss_apply_env_options_or_error(cudssConfig_t config) {
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
+    const char* ir_raw = std::getenv("SPINEAX_CUDSS_IR_N_STEPS");
+    if (ir_raw != nullptr && ir_raw[0] != '\0') {
+        char* end = nullptr;
+        long value = std::strtol(ir_raw, &end, 10);
+        if (end == ir_raw || *end != '\0' || value < 0 ||
+            value > std::numeric_limits<int>::max()) {
+            return xla::ffi::Error::InvalidArgument(
+                std::string("Invalid SPINEAX_CUDSS_IR_N_STEPS value '") + ir_raw +
+                "'. Expected a nonnegative integer.");
+        }
+    }
+
     CudssEnvAlgOption alg = cudss_parse_alg_env("SPINEAX_CUDSS_REORDERING_ALG");
     if (!alg.error.empty()) return xla::ffi::Error::InvalidArgument(alg.error);
     if (alg.should_set) {
