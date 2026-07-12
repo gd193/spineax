@@ -2,7 +2,7 @@
 This is a different method for solving batch systems with cuDSS without actually
 using cuDSS's batch API. This is done as it allows us to retrieve some data which
 is not currently made available when using the batch API. Therefore in subsequent
-releases of cuDSS this file will become redundant and we should only use 
+releases of cuDSS this file will become redundant and we should only use
 - single_solve.cpp
 - batch_solve.cpp
 - ragged_solve.cpp
@@ -18,6 +18,7 @@ they officially support it
 #include <vector>
 #include <complex>
 #include <type_traits>
+#include <string>
 // #include <cuComplex.h> // For device-side complex number operations
 
 #include "cuda_runtime_api.h"
@@ -34,9 +35,29 @@ namespace nb = nanobind;
         status = call; \
         if (status != CUDSS_STATUS_SUCCESS) { \
             printf("FAILED: CUDSS call ended unsuccessfully with status = %d, details: " #msg "\n", status); \
-            return ffi::Error::Success(); \
+            return ffi::Error::Internal(std::string("cuDSS call failed with status ") + \
+                std::to_string(status) + ": " #msg); \
         } \
     } while(0);
+
+#define CUDA_CHECK(call)                                       \
+  do {                                                         \
+    cudaError_t err = call;                                    \
+    if (err != cudaSuccess) {                                  \
+      printf("CUDA Error at %s %d: %s\n", __FILE__, __LINE__,   \
+             cudaGetErrorString(err));                         \
+      return ffi::Error::Internal(std::string("CUDA call failed: ") + cudaGetErrorString(err)); \
+    }                                                          \
+  } while (0)
+
+#define CUDA_LOG_IF_ERROR(call)                                \
+  do {                                                         \
+    cudaError_t err = call;                                    \
+    if (err != cudaSuccess) {                                  \
+      printf("CUDA Error at %s %d: %s\n", __FILE__, __LINE__,   \
+             cudaGetErrorString(err));                         \
+    }                                                          \
+  } while (0)
 
 // debugging ===================================================================
 template <typename T>
@@ -56,12 +77,12 @@ void print_device_data(
     std::vector<T> host_data(total_elements);
 
     // Copy all data from GPU to CPU in one go
-    cudaMemcpy(
+    CUDA_LOG_IF_ERROR(cudaMemcpy(
         host_data.data(),
         device_ptr,
         total_elements * sizeof(T),
         cudaMemcpyDeviceToHost
-    );
+    ));
 
     // Loop through each batch and print its contents
     for (size_t i = 0; i < n_batch; ++i) {
@@ -135,10 +156,10 @@ struct CudssBatchState {
             cudssConfigDestroy(config);
             cudssDestroy(handle);
         }
-        if (diag_temp) cudaFree(diag_temp);
-        if (perm_temp) cudaFree(perm_temp);
-        if (batched_offsets_ptr) cudaFree(batched_offsets_ptr);
-        if (batched_columns_ptr) cudaFree(batched_columns_ptr);
+        if (diag_temp) CUDA_LOG_IF_ERROR(cudaFree(diag_temp));
+        if (perm_temp) CUDA_LOG_IF_ERROR(cudaFree(perm_temp));
+        if (batched_offsets_ptr) CUDA_LOG_IF_ERROR(cudaFree(batched_offsets_ptr));
+        if (batched_columns_ptr) CUDA_LOG_IF_ERROR(cudaFree(batched_columns_ptr));
     }
 };
 
@@ -204,10 +225,7 @@ static ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>> CudssInstantiate(
     // CUDA setup can happen here before any cudaMallocs
     cudaSetDevice(device_id);
 
-    // Allocate temporary storage for diagonal and permutation
-    size_t total_size = batch_size_64 * state->n;
-    cudaMalloc(&state->diag_temp, total_size * sizeof(typename get_native_data_type<T>::type));
-    cudaMalloc(&state->perm_temp, total_size * sizeof(int32_t));
+    // Diagnostic outputs are written directly into FFI result buffers.
 
     return ffi::ErrorOr<std::unique_ptr<CudssBatchState<T>>>(std::move(state));
     // return state; // simply return the created CudssBatchState
@@ -301,14 +319,14 @@ static ffi::Error CudssExecute(
     // printf("in execute \n");
     // cudaStreamSynchronize(stream);
     if (state->call_count == 0) {
-        
+
         // figure this out on first call
         state->n = offsets_buf.element_count() - 1;
         state->nnz = columns_buf.element_count();
 
         // Allocate device memory for batched CSR structure (done once)
-        cudaMallocAsync(&state->batched_columns_ptr, batch_size_64 * state->nnz * sizeof(int32_t), stream);
-        cudaMallocAsync(&state->batched_offsets_ptr, (batch_size_64 * state->n + 1) * sizeof(int32_t), stream);
+        CUDA_CHECK(cudaMallocAsync(&state->batched_columns_ptr, batch_size_64 * state->nnz * sizeof(int32_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&state->batched_offsets_ptr, (batch_size_64 * state->n + 1) * sizeof(int32_t), stream));
 
         // form the new batched offsets and ptrs here!
         create_batched_csr_structure(
@@ -327,7 +345,7 @@ static ffi::Error CudssExecute(
         CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
         CUDSS_CALL_AND_CHECK(cudssConfigCreate(&state->config), state->status, "cudssConfigCreate");
         CUDSS_CALL_AND_CHECK(cudssDataCreate(state->handle, &state->data), state->status, "cudssDataCreate");
-        
+
         // CuDSS structures creation
         int64_t batched_n = state->n * batch_size_64;
         CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, batched_n, state->nrhs, batched_n,
@@ -352,13 +370,13 @@ static ffi::Error CudssExecute(
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         // cold solve - analyze, factorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
 
         // so we dont init again...
@@ -394,18 +412,120 @@ static ffi::Error CudssExecute(
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
 
         // warm solve - refactorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
 
     }
 
-    cudssDataGet(state->handle, state->data, CUDSS_DATA_DIAG, diag_buf->typed_data(),
-                    batch_size_64 * state->n * sizeof(typename get_native_data_type<T>::type), &state->sizeWritten);
-    cudssDataGet(state->handle, state->data, CUDSS_DATA_PERM_REORDER_ROW, perm_buf->typed_data(),
-                    batch_size_64 * state->n * sizeof(int32_t), &state->sizeWritten);
+    CUDSS_CALL_AND_CHECK(cudssDataGet(state->handle, state->data, CUDSS_DATA_DIAG, diag_buf->typed_data(),
+                    batch_size_64 * state->n * sizeof(typename get_native_data_type<T>::type), &state->sizeWritten),
+                    state->status, "cudssDataGet diag");
+    CUDSS_CALL_AND_CHECK(cudssDataGet(state->handle, state->data, CUDSS_DATA_PERM_REORDER_ROW, perm_buf->typed_data(),
+                    batch_size_64 * state->n * sizeof(int32_t), &state->sizeWritten),
+                    state->status, "cudssDataGet perm_reorder_row");
+
+    return ffi::Error::Success();
+}
+
+template <ffi::DataType T>
+static ffi::Error CudssExecuteXOnly(
+    cudaStream_t stream,
+    CudssBatchState<T>* state,
+    ffi::Buffer<T> b_values_buf,
+    ffi::Buffer<T> csr_values_buf,
+    ffi::Buffer<ffi::S32> offsets_buf,
+    ffi::Buffer<ffi::S32> columns_buf,
+    ffi::ResultBuffer<T> out_values_buf,
+    const int64_t batch_size_64,
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id
+) {
+    if (state->call_count == 0) {
+        state->n = offsets_buf.element_count() - 1;
+        state->nnz = columns_buf.element_count();
+
+        CUDA_CHECK(cudaMallocAsync(&state->batched_columns_ptr, batch_size_64 * state->nnz * sizeof(int32_t), stream));
+        CUDA_CHECK(cudaMallocAsync(&state->batched_offsets_ptr, (batch_size_64 * state->n + 1) * sizeof(int32_t), stream));
+
+        create_batched_csr_structure(
+            offsets_buf.typed_data(), columns_buf.typed_data(),
+            state->n, state->nnz, batch_size_64,
+            &state->batched_offsets_ptr, &state->batched_columns_ptr,
+            stream
+        );
+
+        state->cached_offsets_ptr = offsets_buf.typed_data();
+        state->cached_columns_ptr = columns_buf.typed_data();
+
+        CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+        CUDSS_CALL_AND_CHECK(cudssConfigCreate(&state->config), state->status, "cudssConfigCreate");
+        CUDSS_CALL_AND_CHECK(cudssDataCreate(state->handle, &state->data), state->status, "cudssDataCreate");
+
+        int64_t batched_n = state->n * batch_size_64;
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, batched_n, state->nrhs, batched_n,
+            b_values_buf.typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, batched_n, state->nrhs, batched_n,
+            out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
+
+        int64_t batched_nnz = state->nnz * batch_size_64;
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, batched_n, batched_n, batched_nnz,
+            state->batched_offsets_ptr, NULL,
+            state->batched_columns_ptr,
+            csr_values_buf.typed_data(),
+            CUDA_R_32I, state->cuda_dtype,
+            state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
+
+        int iter_ref_nsteps = 5;
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+
+        state->call_count++;
+
+    } else {
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+
+        int32_t* current_offsets_ptr = offsets_buf.typed_data();
+        int32_t* current_columns_ptr = columns_buf.typed_data();
+
+        if (current_offsets_ptr != state->cached_offsets_ptr ||
+            current_columns_ptr != state->cached_columns_ptr) {
+            create_batched_csr_structure(
+                current_offsets_ptr, current_columns_ptr,
+                state->n, state->nnz, batch_size_64,
+                &state->batched_offsets_ptr, &state->batched_columns_ptr,
+                stream
+            );
+
+            state->cached_offsets_ptr = current_offsets_ptr;
+            state->cached_columns_ptr = current_columns_ptr;
+        }
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->A, csr_values_buf.typed_data()), state->status, "update_pointers A");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+
+    }
 
     return ffi::Error::Success();
 }
@@ -432,6 +552,21 @@ static ffi::Error CudssExecute(
             .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
+            /* Attributes must also be passed to execute */ \
+            .Attr<int64_t>("batch_size") \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id")); \
+    \
+    XLA_FFI_DEFINE_HANDLER(kCudssExecuteXOnly##TypeName, CudssExecuteXOnly<DataType>, \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
+            .Ctx<ffi::State<CudssBatchState<DataType>>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<DataType>>() \
             /* Attributes must also be passed to execute */ \
             .Attr<int64_t>("batch_size") \
             .Attr<int64_t>("device_id") \
@@ -471,6 +606,12 @@ DEFINE_CUDSS_FFI_HANDLERS(c128, ffi::C128);
         nb::dict d; \
         d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
         d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecute##TypeName)); \
+        return d; \
+    }); \
+    m.def("handler_xonly_" #TypeName, []() { \
+        nb::dict d; \
+        d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
+        d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecuteXOnly##TypeName)); \
         return d; \
     });
 

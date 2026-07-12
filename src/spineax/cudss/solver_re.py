@@ -3,6 +3,8 @@ solver_re stands for Return Everything
 """
 
 import functools as ft
+import os
+
 import jax
 import jax.core
 import jax.extend.core
@@ -10,6 +12,11 @@ from jax.interpreters import mlir, batching
 import jax.numpy as jnp
 from jaxtyping import Array
 import numpy as np
+
+
+def _cudss_debug_enabled() -> bool:
+    return os.environ.get("SPINEAX_CUDSS_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
 
 # Force JAX to initialize CUDA context BEFORE importing my C++ functions!!!!!!!!
 jax.devices()
@@ -181,10 +188,12 @@ def solve(
         mview_id
     ):
     if csr_values.dtype == jnp.float32:
-        print(f"solving with float32")
+        if _cudss_debug_enabled():
+            print("solving with float32")
         solver = solve_single_f32_re_p
     elif csr_values.dtype == jnp.float64:
-        print(f"solving with float64")
+        if _cudss_debug_enabled():
+            print("solving with float64")
         solver = solve_single_f64_re_p
     elif csr_values.dtype == jnp.complex64:
         solver = solve_single_c64_re_p

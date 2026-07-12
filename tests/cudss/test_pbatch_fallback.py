@@ -51,6 +51,22 @@ class TestPbatchAvailable:
         assert inertia[0] == 5, f"Expected positive inertia 5, got {inertia[0]}"
         assert inertia[1] == 0, f"Expected negative inertia 0, got {inertia[1]}"
 
+    def test_solution_only_static_flag(self):
+        """return_diagnostics=False returns only x and supports pbatch vmap."""
+        from spineax.cudss.solver import CuDSSSolver
+
+        csr_offsets, csr_columns, csr_values, b, true_x = get_test_system()
+        solver = CuDSSSolver(csr_offsets, csr_columns, 0, 1, 1, return_diagnostics=False)
+
+        out = solver(b, csr_values)
+        assert len(out) == 1
+        assert jnp.allclose(out[0], true_x, atol=1e-5)
+
+        b_batch = jnp.stack([b, b * 2, b * 0.5])
+        x_batch = jax.vmap(lambda bi: solver(bi, csr_values)[0])(b_batch)
+        assert x_batch.shape == (3, 5)
+        assert jnp.allclose(x_batch[0], true_x, atol=1e-5)
+
     def test_batched_solve_inertia(self):
         """Test batched solve returns correct inertia with pbatch."""
         from spineax.cudss.solver import CuDSSSolver

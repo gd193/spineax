@@ -1,4 +1,6 @@
 import functools as ft
+import os
+
 import jax
 import jax.core
 import jax.extend.core
@@ -7,6 +9,11 @@ import jax.numpy as jnp
 from jaxtyping import Array
 import numpy as np
 import equinox as eqx
+
+
+def _cudss_debug_enabled() -> bool:
+    return os.environ.get("SPINEAX_CUDSS_DEBUG", "").lower() in {"1", "true", "yes", "on"}
+
 
 # Force JAX to initialize CUDA context BEFORE importing my C++ functions!!!!!!!!
 jax.devices()
@@ -30,6 +37,14 @@ solve_single_c64_p = jax.extend.core.Primitive("solve_single_c64")
 solve_single_c64_p.multiple_results = True
 solve_single_c128_p = jax.extend.core.Primitive("solve_single_c128")
 solve_single_c128_p.multiple_results = True
+solve_single_f32_xonly_p = jax.extend.core.Primitive("solve_single_f32_xonly")
+solve_single_f32_xonly_p.multiple_results = True
+solve_single_f64_xonly_p = jax.extend.core.Primitive("solve_single_f64_xonly")
+solve_single_f64_xonly_p.multiple_results = True
+solve_single_c64_xonly_p = jax.extend.core.Primitive("solve_single_c64_xonly")
+solve_single_c64_xonly_p.multiple_results = True
+solve_single_c128_xonly_p = jax.extend.core.Primitive("solve_single_c128_xonly")
+solve_single_c128_xonly_p.multiple_results = True
 
 # batch
 solve_batch_f32_p = jax.extend.core.Primitive("solve_batch_f32")
@@ -40,6 +55,14 @@ solve_batch_c64_p = jax.extend.core.Primitive("solve_batch_c64")
 solve_batch_c64_p.multiple_results = True
 solve_batch_c128_p = jax.extend.core.Primitive("solve_batch_c128")
 solve_batch_c128_p.multiple_results = True
+solve_batch_f32_xonly_p = jax.extend.core.Primitive("solve_batch_f32_xonly")
+solve_batch_f32_xonly_p.multiple_results = True
+solve_batch_f64_xonly_p = jax.extend.core.Primitive("solve_batch_f64_xonly")
+solve_batch_f64_xonly_p.multiple_results = True
+solve_batch_c64_xonly_p = jax.extend.core.Primitive("solve_batch_c64_xonly")
+solve_batch_c64_xonly_p.multiple_results = True
+solve_batch_c128_xonly_p = jax.extend.core.Primitive("solve_batch_c128_xonly")
+solve_batch_c128_xonly_p.multiple_results = True
 
 # pseudo batch
 solve_pbatch_f32_p = jax.extend.core.Primitive("solve_pbatch_f32")
@@ -50,6 +73,14 @@ solve_pbatch_c64_p = jax.extend.core.Primitive("solve_pbatch_c64")
 solve_pbatch_c64_p.multiple_results = True
 solve_pbatch_c128_p = jax.extend.core.Primitive("solve_pbatch_c128")
 solve_pbatch_c128_p.multiple_results = True
+solve_pbatch_f32_xonly_p = jax.extend.core.Primitive("solve_pbatch_f32_xonly")
+solve_pbatch_f32_xonly_p.multiple_results = True
+solve_pbatch_f64_xonly_p = jax.extend.core.Primitive("solve_pbatch_f64_xonly")
+solve_pbatch_f64_xonly_p.multiple_results = True
+solve_pbatch_c64_xonly_p = jax.extend.core.Primitive("solve_pbatch_c64_xonly")
+solve_pbatch_c64_xonly_p.multiple_results = True
+solve_pbatch_c128_xonly_p = jax.extend.core.Primitive("solve_pbatch_c128_xonly")
+solve_pbatch_c128_xonly_p.multiple_results = True
 
 # Helper function to compute inertia from diag and perm
 def compute_inertia_from_diag_perm(diag, perm, batch_size, matrix_dim):
@@ -131,6 +162,18 @@ def solve_single_c64_impl(*args, **kwargs):
 @solve_single_c128_p.def_impl
 def solve_single_c128_impl(*args, **kwargs):
     return general_single_solve_impl("solve_single_c128", *args, **kwargs)
+@solve_single_f32_xonly_p.def_impl
+def solve_single_f32_xonly_impl(*args, **kwargs):
+    return general_single_solve_xonly_impl("solve_single_f32_xonly", *args, **kwargs)
+@solve_single_f64_xonly_p.def_impl
+def solve_single_f64_xonly_impl(*args, **kwargs):
+    return general_single_solve_xonly_impl("solve_single_f64_xonly", *args, **kwargs)
+@solve_single_c64_xonly_p.def_impl
+def solve_single_c64_xonly_impl(*args, **kwargs):
+    return general_single_solve_xonly_impl("solve_single_c64_xonly", *args, **kwargs)
+@solve_single_c128_xonly_p.def_impl
+def solve_single_c128_xonly_impl(*args, **kwargs):
+    return general_single_solve_xonly_impl("solve_single_c128_xonly", *args, **kwargs)
 
 def general_single_solve_impl(
         name, 
@@ -169,6 +212,33 @@ def general_single_solve_impl(
     inertia = compute_inertia_from_diag_perm(diag, perm, batch_size, matrix_dim)
     return [x, inertia[0]]  # Return solution and inertia for single batch
 
+
+def general_single_solve_xonly_impl(
+        name,
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        device_id,
+        mtype_id,
+        mview_id
+    ):
+    call = jax.ffi.ffi_call(
+        name,
+        (jax.ShapeDtypeStruct(b_values.shape, b_values.dtype),),
+        has_side_effect=True
+    )
+    x, = call(
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        device_id=device_id,
+        mtype_id=mtype_id,
+        mview_id=mview_id,
+    )
+    return [x]
+
 @solve_batch_f32_p.def_impl
 def solve_batch_f32_impl(*args, **kwargs):
     return general_batch_solve_impl("solve_batch_f32", *args, **kwargs)
@@ -181,6 +251,18 @@ def solve_batch_c64_impl(*args, **kwargs):
 @solve_batch_c128_p.def_impl
 def solve_batch_c128_impl(*args, **kwargs):
     return general_batch_solve_impl("solve_batch_c128", *args, **kwargs)
+@solve_batch_f32_xonly_p.def_impl
+def solve_batch_f32_xonly_impl(*args, **kwargs):
+    return general_batch_solve_xonly_impl("solve_batch_f32_xonly", *args, **kwargs)
+@solve_batch_f64_xonly_p.def_impl
+def solve_batch_f64_xonly_impl(*args, **kwargs):
+    return general_batch_solve_xonly_impl("solve_batch_f64_xonly", *args, **kwargs)
+@solve_batch_c64_xonly_p.def_impl
+def solve_batch_c64_xonly_impl(*args, **kwargs):
+    return general_batch_solve_xonly_impl("solve_batch_c64_xonly", *args, **kwargs)
+@solve_batch_c128_xonly_p.def_impl
+def solve_batch_c128_xonly_impl(*args, **kwargs):
+    return general_batch_solve_xonly_impl("solve_batch_c128_xonly", *args, **kwargs)
 
 def general_batch_solve_impl(
         name, 
@@ -217,6 +299,35 @@ def general_batch_solve_impl(
     return [x, inertia]
 
 
+def general_batch_solve_xonly_impl(
+        name,
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        batch_size,
+        device_id,
+        mtype_id,
+        mview_id
+    ):
+    call = jax.ffi.ffi_call(
+        name,
+        (jax.ShapeDtypeStruct(b_values.shape, b_values.dtype),),
+        has_side_effect=True
+    )
+    x, = call(
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        batch_size=batch_size,
+        device_id=device_id,
+        mtype_id=mtype_id,
+        mview_id=mview_id,
+    )
+    return [x]
+
+
 @solve_pbatch_f32_p.def_impl
 def solve_pbatch_f32_impl(*args, **kwargs):
     return general_pbatch_solve_impl("solve_pbatch_f32", *args, **kwargs)
@@ -229,6 +340,18 @@ def solve_pbatch_c64_impl(*args, **kwargs):
 @solve_pbatch_c128_p.def_impl
 def solve_pbatch_c128_impl(*args, **kwargs):
     return general_pbatch_solve_impl("solve_pbatch_c128", *args, **kwargs)
+@solve_pbatch_f32_xonly_p.def_impl
+def solve_pbatch_f32_xonly_impl(*args, **kwargs):
+    return general_pbatch_solve_xonly_impl("solve_pbatch_f32_xonly", *args, **kwargs)
+@solve_pbatch_f64_xonly_p.def_impl
+def solve_pbatch_f64_xonly_impl(*args, **kwargs):
+    return general_pbatch_solve_xonly_impl("solve_pbatch_f64_xonly", *args, **kwargs)
+@solve_pbatch_c64_xonly_p.def_impl
+def solve_pbatch_c64_xonly_impl(*args, **kwargs):
+    return general_pbatch_solve_xonly_impl("solve_pbatch_c64_xonly", *args, **kwargs)
+@solve_pbatch_c128_xonly_p.def_impl
+def solve_pbatch_c128_xonly_impl(*args, **kwargs):
+    return general_pbatch_solve_xonly_impl("solve_pbatch_c128_xonly", *args, **kwargs)
 
 def general_pbatch_solve_impl(
         name, 
@@ -266,8 +389,38 @@ def general_pbatch_solve_impl(
     # Compute inertia instead of returning diag and perm
     matrix_dim = b_values.shape[1]  # Assuming b_values shape is (batch_size, n)
     inertia = compute_inertia_from_diag_perm(diag, perm, batch_size, matrix_dim)
-    jax.debug.print("inertia: {}", inertia)
+    if _cudss_debug_enabled():
+        jax.debug.print("inertia: {}", inertia)
     return [x, inertia]
+
+
+def general_pbatch_solve_xonly_impl(
+        name,
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        batch_size,
+        device_id,
+        mtype_id,
+        mview_id
+    ):
+    call = jax.ffi.ffi_call(
+        name,
+        (jax.ShapeDtypeStruct(b_values.shape, b_values.dtype),),
+        has_side_effect=True
+    )
+    x, = call(
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        batch_size=batch_size,
+        device_id=device_id,
+        mtype_id=mtype_id,
+        mview_id=mview_id,
+    )
+    return [x]
 
 # registrations and lowerings ==================================================
 try:
@@ -279,8 +432,9 @@ except ImportError:
 
 def register_ffi(name: str, func, *, type: str, platform: str = "CUDA"):
     handler = getattr(func, f"handler_{type}")()
-    state_dict = getattr(func, f"state_dict_{type}")()
-    type_id = getattr(func, f"type_id_{type}")()
+    state_type = type.removeprefix("xonly_")
+    state_dict = getattr(func, f"state_dict_{state_type}")()
+    type_id = getattr(func, f"type_id_{state_type}")()
     if _NEW_FFI_API:
         jax.ffi.register_ffi_type(name, state_dict, platform=platform)
     else:
@@ -293,6 +447,10 @@ register_ffi("solve_single_f32", single_solve, type="f32")
 register_ffi("solve_single_f64", single_solve, type="f64")
 register_ffi("solve_single_c64", single_solve, type="c64")
 register_ffi("solve_single_c128", single_solve, type="c128")
+register_ffi("solve_single_f32_xonly", single_solve, type="xonly_f32")
+register_ffi("solve_single_f64_xonly", single_solve, type="xonly_f64")
+register_ffi("solve_single_c64_xonly", single_solve, type="xonly_c64")
+register_ffi("solve_single_c128_xonly", single_solve, type="xonly_c128")
 
 solve_single_f32_low = mlir.lower_fun(solve_single_f32_impl, multiple_results=True)
 mlir.register_lowering(solve_single_f32_p, solve_single_f32_low)
@@ -302,12 +460,24 @@ solve_single_c64_low = mlir.lower_fun(solve_single_c64_impl, multiple_results=Tr
 mlir.register_lowering(solve_single_c64_p, solve_single_c64_low)
 solve_single_c128_low = mlir.lower_fun(solve_single_c128_impl, multiple_results=True)
 mlir.register_lowering(solve_single_c128_p, solve_single_c128_low)
+solve_single_f32_xonly_low = mlir.lower_fun(solve_single_f32_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_single_f32_xonly_p, solve_single_f32_xonly_low)
+solve_single_f64_xonly_low = mlir.lower_fun(solve_single_f64_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_single_f64_xonly_p, solve_single_f64_xonly_low)
+solve_single_c64_xonly_low = mlir.lower_fun(solve_single_c64_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_single_c64_xonly_p, solve_single_c64_xonly_low)
+solve_single_c128_xonly_low = mlir.lower_fun(solve_single_c128_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_single_c128_xonly_p, solve_single_c128_xonly_low)
 
 # batch
 register_ffi("solve_batch_f32", batch_solve, type="f32")
 register_ffi("solve_batch_f64", batch_solve, type="f64")
 register_ffi("solve_batch_c64", batch_solve, type="c64")
 register_ffi("solve_batch_c128", batch_solve, type="c128")
+register_ffi("solve_batch_f32_xonly", batch_solve, type="xonly_f32")
+register_ffi("solve_batch_f64_xonly", batch_solve, type="xonly_f64")
+register_ffi("solve_batch_c64_xonly", batch_solve, type="xonly_c64")
+register_ffi("solve_batch_c128_xonly", batch_solve, type="xonly_c128")
 
 solve_batch_f32_low = mlir.lower_fun(solve_batch_f32_impl, multiple_results=True)
 mlir.register_lowering(solve_batch_f32_p, solve_batch_f32_low)
@@ -317,6 +487,14 @@ solve_batch_c64_low = mlir.lower_fun(solve_batch_c64_impl, multiple_results=True
 mlir.register_lowering(solve_batch_c64_p, solve_batch_c64_low)
 solve_batch_c128_low = mlir.lower_fun(solve_batch_c128_impl, multiple_results=True)
 mlir.register_lowering(solve_batch_c128_p, solve_batch_c128_low)
+solve_batch_f32_xonly_low = mlir.lower_fun(solve_batch_f32_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_batch_f32_xonly_p, solve_batch_f32_xonly_low)
+solve_batch_f64_xonly_low = mlir.lower_fun(solve_batch_f64_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_batch_f64_xonly_p, solve_batch_f64_xonly_low)
+solve_batch_c64_xonly_low = mlir.lower_fun(solve_batch_c64_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_batch_c64_xonly_p, solve_batch_c64_xonly_low)
+solve_batch_c128_xonly_low = mlir.lower_fun(solve_batch_c128_xonly_impl, multiple_results=True)
+mlir.register_lowering(solve_batch_c128_xonly_p, solve_batch_c128_xonly_low)
 
 # psuedo batch (optional - may not be available if CUDA version mismatch)
 if PBATCH_AVAILABLE:
@@ -324,6 +502,10 @@ if PBATCH_AVAILABLE:
     register_ffi("solve_pbatch_f64", pbatch_solve, type="f64")
     register_ffi("solve_pbatch_c64", pbatch_solve, type="c64")
     register_ffi("solve_pbatch_c128", pbatch_solve, type="c128")
+    register_ffi("solve_pbatch_f32_xonly", pbatch_solve, type="xonly_f32")
+    register_ffi("solve_pbatch_f64_xonly", pbatch_solve, type="xonly_f64")
+    register_ffi("solve_pbatch_c64_xonly", pbatch_solve, type="xonly_c64")
+    register_ffi("solve_pbatch_c128_xonly", pbatch_solve, type="xonly_c128")
 
     solve_pbatch_f32_low = mlir.lower_fun(solve_pbatch_f32_impl, multiple_results=True)
     mlir.register_lowering(solve_pbatch_f32_p, solve_pbatch_f32_low)
@@ -333,6 +515,14 @@ if PBATCH_AVAILABLE:
     mlir.register_lowering(solve_pbatch_c64_p, solve_pbatch_c64_low)
     solve_pbatch_c128_low = mlir.lower_fun(solve_pbatch_c128_impl, multiple_results=True)
     mlir.register_lowering(solve_pbatch_c128_p, solve_pbatch_c128_low)
+    solve_pbatch_f32_xonly_low = mlir.lower_fun(solve_pbatch_f32_xonly_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_f32_xonly_p, solve_pbatch_f32_xonly_low)
+    solve_pbatch_f64_xonly_low = mlir.lower_fun(solve_pbatch_f64_xonly_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_f64_xonly_p, solve_pbatch_f64_xonly_low)
+    solve_pbatch_c64_xonly_low = mlir.lower_fun(solve_pbatch_c64_xonly_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_c64_xonly_p, solve_pbatch_c64_xonly_low)
+    solve_pbatch_c128_xonly_low = mlir.lower_fun(solve_pbatch_c128_xonly_impl, multiple_results=True)
+    mlir.register_lowering(solve_pbatch_c128_xonly_p, solve_pbatch_c128_xonly_low)
 
 # abstract evaluations =========================================================
 @solve_single_f32_p.def_abstract_eval
@@ -353,6 +543,21 @@ def solve_aval(
             jax.core.ShapedArray((2,), jnp.int32),                      # inertia [positive, negative]
         ]
 
+@solve_single_f32_xonly_p.def_abstract_eval
+@solve_single_f64_xonly_p.def_abstract_eval
+@solve_single_c64_xonly_p.def_abstract_eval
+@solve_single_c128_xonly_p.def_abstract_eval
+def solve_xonly_aval(
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        device_id,
+        mtype_id,
+        mview_id
+    ):
+    return [jax.core.ShapedArray(b_values.shape, b_values.dtype)]
+
 @solve_batch_f32_p.def_abstract_eval
 @solve_batch_f64_p.def_abstract_eval
 @solve_batch_c64_p.def_abstract_eval
@@ -371,6 +576,22 @@ def solve_batch_aval(
             jax.core.ShapedArray(b_values.shape, b_values.dtype),       # x
             jax.core.ShapedArray((batch_size, 2), jnp.int32),           # inertia [positive, negative]
         ]
+
+@solve_batch_f32_xonly_p.def_abstract_eval
+@solve_batch_f64_xonly_p.def_abstract_eval
+@solve_batch_c64_xonly_p.def_abstract_eval
+@solve_batch_c128_xonly_p.def_abstract_eval
+def solve_batch_xonly_aval(
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        batch_size,
+        device_id,
+        mtype_id,
+        mview_id
+    ):
+    return [jax.core.ShapedArray(b_values.shape, b_values.dtype)]
 
 @solve_pbatch_f32_p.def_abstract_eval
 @solve_pbatch_f64_p.def_abstract_eval
@@ -391,12 +612,29 @@ def solve_pbatch_aval(
             jax.core.ShapedArray((batch_size, 2), jnp.int32),           # inertia [positive, negative]
         ]
 
+@solve_pbatch_f32_xonly_p.def_abstract_eval
+@solve_pbatch_f64_xonly_p.def_abstract_eval
+@solve_pbatch_c64_xonly_p.def_abstract_eval
+@solve_pbatch_c128_xonly_p.def_abstract_eval
+def solve_pbatch_xonly_aval(
+        b_values,
+        csr_values,
+        csr_offsets,
+        csr_columns,
+        batch_size,
+        device_id,
+        mtype_id,
+        mview_id
+    ):
+    return [jax.core.ShapedArray(b_values.shape, b_values.dtype)]
+
 # single solve interface =======================================================
 @ft.partial(
     jax.jit, static_argnames=[
         "device_id",
         "mtype_id",
-        "mview_id"
+        "mview_id",
+        "return_diagnostics"
     ]
 )
 def solve(
@@ -406,18 +644,21 @@ def solve(
         csr_columns,
         device_id, 
         mtype_id, 
-        mview_id
+        mview_id,
+        return_diagnostics=True
     ):
     if csr_values.dtype == jnp.float32:
-        print(f"solving with float32")
-        solver = solve_single_f32_p
+        if _cudss_debug_enabled():
+            print("solving with float32")
+        solver = solve_single_f32_p if return_diagnostics else solve_single_f32_xonly_p
     elif csr_values.dtype == jnp.float64:
-        print(f"solving with float64")
-        solver = solve_single_f64_p
+        if _cudss_debug_enabled():
+            print("solving with float64")
+        solver = solve_single_f64_p if return_diagnostics else solve_single_f64_xonly_p
     elif csr_values.dtype == jnp.complex64:
-        solver = solve_single_c64_p
+        solver = solve_single_c64_p if return_diagnostics else solve_single_c64_xonly_p
     elif csr_values.dtype == jnp.complex128:
-        solver = solve_single_c128_p
+        solver = solve_single_c128_p if return_diagnostics else solve_single_c128_xonly_p
     else:
         raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
@@ -437,7 +678,8 @@ def solve(
         "batch_size",
         "device_id",
         "mtype_id",
-        "mview_id"
+        "mview_id",
+        "return_diagnostics"
     ]
 )
 def batch_solve(
@@ -448,18 +690,21 @@ def batch_solve(
         batch_size,
         device_id, 
         mtype_id, 
-        mview_id
+        mview_id,
+        return_diagnostics=True
     ):
     if csr_values.dtype == jnp.float32:
-        print(f"solving with float32")
-        solver = solve_batch_f32_p
+        if _cudss_debug_enabled():
+            print("solving with float32")
+        solver = solve_batch_f32_p if return_diagnostics else solve_batch_f32_xonly_p
     elif csr_values.dtype == jnp.float64:
-        print(f"solving with float64")
-        solver = solve_batch_f64_p
+        if _cudss_debug_enabled():
+            print("solving with float64")
+        solver = solve_batch_f64_p if return_diagnostics else solve_batch_f64_xonly_p
     elif csr_values.dtype == jnp.complex64:
-        solver = solve_batch_c64_p
+        solver = solve_batch_c64_p if return_diagnostics else solve_batch_c64_xonly_p
     elif csr_values.dtype == jnp.complex128:
-        solver = solve_batch_c128_p
+        solver = solve_batch_c128_p if return_diagnostics else solve_batch_c128_xonly_p
     else:
         raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
@@ -481,7 +726,8 @@ def batch_solve(
         "batch_size",
         "device_id",
         "mtype_id",
-        "mview_id"
+        "mview_id",
+        "return_diagnostics"
     ]
 )
 def pbatch_solve(
@@ -492,18 +738,21 @@ def pbatch_solve(
         batch_size,
         device_id, 
         mtype_id, 
-        mview_id
+        mview_id,
+        return_diagnostics=True
     ):
     if csr_values.dtype == jnp.float32:
-        print(f"solving with float32")
-        solver = solve_pbatch_f32_p
+        if _cudss_debug_enabled():
+            print("solving with float32")
+        solver = solve_pbatch_f32_p if return_diagnostics else solve_pbatch_f32_xonly_p
     elif csr_values.dtype == jnp.float64:
-        print(f"solving with float64")
-        solver = solve_pbatch_f64_p
+        if _cudss_debug_enabled():
+            print("solving with float64")
+        solver = solve_pbatch_f64_p if return_diagnostics else solve_pbatch_f64_xonly_p
     elif csr_values.dtype == jnp.complex64:
-        solver = solve_pbatch_c64_p
+        solver = solve_pbatch_c64_p if return_diagnostics else solve_pbatch_c64_xonly_p
     elif csr_values.dtype == jnp.complex128:
-        solver = solve_pbatch_c128_p
+        solver = solve_pbatch_c128_p if return_diagnostics else solve_pbatch_c128_xonly_p
     else:
         raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
@@ -528,6 +777,14 @@ def solve_single_c64_vmap(vector_arg_values, batch_axes, **kwargs):
     return general_solve_vmap(vector_arg_values, batch_axes, **kwargs)
 def solve_single_c128_vmap(vector_arg_values, batch_axes, **kwargs):
     return general_solve_vmap(vector_arg_values, batch_axes, **kwargs)
+def solve_single_f32_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
+    return general_solve_vmap(vector_arg_values, batch_axes, return_diagnostics=False, **kwargs)
+def solve_single_f64_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
+    return general_solve_vmap(vector_arg_values, batch_axes, return_diagnostics=False, **kwargs)
+def solve_single_c64_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
+    return general_solve_vmap(vector_arg_values, batch_axes, return_diagnostics=False, **kwargs)
+def solve_single_c128_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
+    return general_solve_vmap(vector_arg_values, batch_axes, return_diagnostics=False, **kwargs)
 
 # Use pseudo_batch if available (provides correct inertia), fall back to batch_solve otherwise
 vmap_using_pseudo_batch = PBATCH_AVAILABLE
@@ -547,9 +804,13 @@ def general_solve_vmap(
 
     b_values, csr_values, csr_offsets, csr_columns = vector_arg_values
     a_b, a_val, a_off, a_col = batch_axes
+    return_diagnostics = kwargs.get("return_diagnostics", True)
+    bind_kwargs = dict(kwargs)
+    bind_kwargs.pop("return_diagnostics", None)
+    out_axes = (0, 0) if return_diagnostics else (0,)
 
-    # Debug output
-    jax.debug.print("vmap batch_axes: a_b={}, a_val={}, a_off={}, a_col={}", a_b, a_val, a_off, a_col)
+    if _cudss_debug_enabled():
+        jax.debug.print("vmap batch_axes: a_b={}, a_val={}, a_off={}, a_col={}", a_b, a_val, a_off, a_col)
 
     # Handle spurious batch axes on sparsity patterns.
     # This happens when the solve is inside a jax.lax.switch that gets vmapped -
@@ -574,7 +835,7 @@ def general_solve_vmap(
     
     # the non-batched path
     if a_val is None and a_b is None:
-        return solve(*vector_arg_values, **kwargs), (None, None)
+        return solve(*vector_arg_values, **kwargs), ((None, None) if return_diagnostics else (None,))
 
     # if only one of the sets of values are batched
     elif (a_val is None) != (a_b is None):
@@ -585,28 +846,28 @@ def general_solve_vmap(
 
             if vmap_using_pseudo_batch:
                 if csr_values.dtype == jnp.float32:
-                    solver = solve_pbatch_f32_p
+                    solver = solve_pbatch_f32_p if return_diagnostics else solve_pbatch_f32_xonly_p
                 elif csr_values.dtype == jnp.float64:
-                    solver = solve_pbatch_f64_p
+                    solver = solve_pbatch_f64_p if return_diagnostics else solve_pbatch_f64_xonly_p
                 elif csr_values.dtype == jnp.complex64:
-                    solver = solve_pbatch_c64_p
+                    solver = solve_pbatch_c64_p if return_diagnostics else solve_pbatch_c64_xonly_p
                 elif csr_values.dtype == jnp.complex128:
-                    solver = solve_pbatch_c128_p
+                    solver = solve_pbatch_c128_p if return_diagnostics else solve_pbatch_c128_xonly_p
                 else:
                     raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
             else:
                 if csr_values.dtype == jnp.float32:
-                    solver = solve_batch_f32_p
+                    solver = solve_batch_f32_p if return_diagnostics else solve_batch_f32_xonly_p
                 elif csr_values.dtype == jnp.float64:
-                    solver = solve_batch_f64_p
+                    solver = solve_batch_f64_p if return_diagnostics else solve_batch_f64_xonly_p
                 elif csr_values.dtype == jnp.complex64:
-                    solver = solve_batch_c64_p
+                    solver = solve_batch_c64_p if return_diagnostics else solve_batch_c64_xonly_p
                 elif csr_values.dtype == jnp.complex128:
-                    solver = solve_batch_c128_p
+                    solver = solve_batch_c128_p if return_diagnostics else solve_batch_c128_xonly_p
                 else:
                     raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
-            return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0, 0)
+            return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **bind_kwargs), out_axes
         else:
             # Only csr_values is batched (not b) - not supported
             raise NotImplementedError("Only csr_values batched (not b_values) is not supported")
@@ -614,29 +875,29 @@ def general_solve_vmap(
     # the batched path binding
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is False:
         if csr_values.dtype == jnp.float32:
-            solver = solve_batch_f32_p
+            solver = solve_batch_f32_p if return_diagnostics else solve_batch_f32_xonly_p
         elif csr_values.dtype == jnp.float64:
-            solver = solve_batch_f64_p
+            solver = solve_batch_f64_p if return_diagnostics else solve_batch_f64_xonly_p
         elif csr_values.dtype == jnp.complex64:
-            solver = solve_batch_c64_p
+            solver = solve_batch_c64_p if return_diagnostics else solve_batch_c64_xonly_p
         elif csr_values.dtype == jnp.complex128:
-            solver = solve_batch_c128_p
+            solver = solve_batch_c128_p if return_diagnostics else solve_batch_c128_xonly_p
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
-        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0, 0)
+        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **bind_kwargs), out_axes
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is True:
         if csr_values.dtype == jnp.float32:
-            solver = solve_pbatch_f32_p
+            solver = solve_pbatch_f32_p if return_diagnostics else solve_pbatch_f32_xonly_p
         elif csr_values.dtype == jnp.float64:
-            solver = solve_pbatch_f64_p
+            solver = solve_pbatch_f64_p if return_diagnostics else solve_pbatch_f64_xonly_p
         elif csr_values.dtype == jnp.complex64:
-            solver = solve_pbatch_c64_p
+            solver = solve_pbatch_c64_p if return_diagnostics else solve_pbatch_c64_xonly_p
         elif csr_values.dtype == jnp.complex128:
-            solver = solve_pbatch_c128_p
+            solver = solve_pbatch_c128_p if return_diagnostics else solve_pbatch_c128_xonly_p
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
-        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs), (0, 0)
+        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **bind_kwargs), out_axes
     
     else:
         raise NotImplementedError("This path should not be possible")
@@ -645,12 +906,20 @@ batching.primitive_batchers[solve_single_f32_p] = solve_single_f32_vmap
 batching.primitive_batchers[solve_single_f64_p] = solve_single_f64_vmap
 batching.primitive_batchers[solve_single_c64_p] = solve_single_c64_vmap
 batching.primitive_batchers[solve_single_c128_p] = solve_single_c128_vmap
+batching.primitive_batchers[solve_single_f32_xonly_p] = solve_single_f32_xonly_vmap
+batching.primitive_batchers[solve_single_f64_xonly_p] = solve_single_f64_xonly_vmap
+batching.primitive_batchers[solve_single_c64_xonly_p] = solve_single_c64_xonly_vmap
+batching.primitive_batchers[solve_single_c128_xonly_p] = solve_single_c128_xonly_vmap
 
 # vmap of vmap
 def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
     """Handle vmap of already-batched solve"""
     b_values, csr_values, csr_offsets, csr_columns = vector_arg_values
     a_b, a_val, a_off, a_col = batch_axes
+    return_diagnostics = kwargs.get("return_diagnostics", True)
+    bind_kwargs = dict(kwargs)
+    bind_kwargs.pop("return_diagnostics", None)
+    out_axes = (0, 0) if return_diagnostics else (0,)
 
     # Handle spurious batch axes on sparsity patterns (same fix as general_solve_vmap)
     if a_off is not None:
@@ -666,7 +935,7 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
 
     if a_b is None and a_val is None:
         # Not actually batching
-        return batch_solve(*vector_arg_values, **kwargs), (None, None)
+        return batch_solve(*vector_arg_values, **kwargs), ((None, None) if return_diagnostics else (None,))
     
     # Flatten nested batches
     batch_size1 = b_values.shape[0]
@@ -678,7 +947,7 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
     
     # the non-batched path
     if a_val is None and a_b is None:
-        return solve(*vector_arg_values, **kwargs), (None, None)
+        return solve(*vector_arg_values, **kwargs), ((None, None) if return_diagnostics else (None,))
 
     # if only one of the sets of values are batched
     elif (a_val is None) != (a_b is None):
@@ -690,93 +959,112 @@ def solve_batch_vmap(vector_arg_values, batch_axes, **kwargs):
 
             if vmap_using_pseudo_batch:
                 if csr_values.dtype == jnp.float32:
-                    solver = solve_pbatch_f32_p
+                    solver = solve_pbatch_f32_p if return_diagnostics else solve_pbatch_f32_xonly_p
                 elif csr_values.dtype == jnp.float64:
-                    solver = solve_pbatch_f64_p
+                    solver = solve_pbatch_f64_p if return_diagnostics else solve_pbatch_f64_xonly_p
                 elif csr_values.dtype == jnp.complex64:
-                    solver = solve_pbatch_c64_p
+                    solver = solve_pbatch_c64_p if return_diagnostics else solve_pbatch_c64_xonly_p
                 elif csr_values.dtype == jnp.complex128:
-                    solver = solve_pbatch_c128_p
+                    solver = solve_pbatch_c128_p if return_diagnostics else solve_pbatch_c128_xonly_p
                 else:
                     raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
             else:
                 if csr_values.dtype == jnp.float32:
-                    solver = solve_batch_f32_p
+                    solver = solve_batch_f32_p if return_diagnostics else solve_batch_f32_xonly_p
                 elif csr_values.dtype == jnp.float64:
-                    solver = solve_batch_f64_p
+                    solver = solve_batch_f64_p if return_diagnostics else solve_batch_f64_xonly_p
                 elif csr_values.dtype == jnp.complex64:
-                    solver = solve_batch_c64_p
+                    solver = solve_batch_c64_p if return_diagnostics else solve_batch_c64_xonly_p
                 elif csr_values.dtype == jnp.complex128:
-                    solver = solve_batch_c128_p
+                    solver = solve_batch_c128_p if return_diagnostics else solve_batch_c128_xonly_p
                 else:
                     raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
             total_batch = b_flat.shape[0]
             # Remove old batch_size from kwargs
-            kwargs_copy = dict(kwargs)
+            kwargs_copy = dict(bind_kwargs)
             kwargs_copy.pop("batch_size", None)
-            x_flat, inertia_flat = solver.bind(
+            outputs = solver.bind(
                 b_flat, csr_flat, csr_offsets, csr_columns,
                 batch_size=total_batch,
                 **kwargs_copy
             )
 
             # Reshape back
-            x = x_flat.reshape(b_values.shape[0], b_values.shape[1], -1)
-            inertia = inertia_flat.reshape(b_values.shape[0], b_values.shape[1], 2)
+            x = outputs[0].reshape(b_values.shape[0], b_values.shape[1], -1)
+            if not return_diagnostics:
+                return (x,), out_axes
+            inertia = outputs[1].reshape(b_values.shape[0], b_values.shape[1], 2)
 
-            return (x, inertia), (0, 0)
+            return (x, inertia), out_axes
         else:
             # Only csr_values is batched (not b) - not supported
             raise NotImplementedError("Only csr_values batched (not b_values) is not supported")
 
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is False:
         if csr_values.dtype == jnp.float32:
-            solver = solve_batch_f32_p
+            solver = solve_batch_f32_p if return_diagnostics else solve_batch_f32_xonly_p
         elif csr_values.dtype == jnp.float64:
-            solver = solve_batch_f64_p
+            solver = solve_batch_f64_p if return_diagnostics else solve_batch_f64_xonly_p
         elif csr_values.dtype == jnp.complex64:
-            solver = solve_batch_c64_p
+            solver = solve_batch_c64_p if return_diagnostics else solve_batch_c64_xonly_p
         elif csr_values.dtype == jnp.complex128:
-            solver = solve_batch_c128_p
+            solver = solve_batch_c128_p if return_diagnostics else solve_batch_c128_xonly_p
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
         # Remove batch_size from kwargs if present (happens with nested vmap)
-        kwargs_copy = dict(kwargs)
+        kwargs_copy = dict(bind_kwargs)
         kwargs_copy.pop("batch_size", None)
-        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs_copy), (0,0)
+        return solver.bind(*vector_arg_values, batch_size=b_values.shape[0], **kwargs_copy), out_axes
     elif a_val is not None and a_b is not None and vmap_using_pseudo_batch is True:
         if csr_values.dtype == jnp.float32:
-            solver = solve_pbatch_f32_p
+            solver = solve_pbatch_f32_p if return_diagnostics else solve_pbatch_f32_xonly_p
         elif csr_values.dtype == jnp.float64:
-            solver = solve_pbatch_f64_p
+            solver = solve_pbatch_f64_p if return_diagnostics else solve_pbatch_f64_xonly_p
         elif csr_values.dtype == jnp.complex64:
-            solver = solve_pbatch_c64_p
+            solver = solve_pbatch_c64_p if return_diagnostics else solve_pbatch_c64_xonly_p
         elif csr_values.dtype == jnp.complex128:
-            solver = solve_pbatch_c128_p
+            solver = solve_pbatch_c128_p if return_diagnostics else solve_pbatch_c128_xonly_p
         else:
             raise ValueError(f"Unsupported dtype: {csr_values.dtype}")
 
     # Remove batch_size from kwargs if present (happens with nested vmap)
-    kwargs_copy = dict(kwargs)
+    kwargs_copy = dict(bind_kwargs)
     kwargs_copy.pop("batch_size", None)
 
-    x_flat, inertia_flat = solver.bind(
+    outputs = solver.bind(
         b_flat, csr_flat, csr_offsets, csr_columns,
         batch_size=total_batch,
         **kwargs_copy
     )
     
     # Reshape back
-    x = x_flat.reshape(batch_size1, batch_size2, -1)
-    inertia = inertia_flat.reshape(batch_size1, batch_size2, 2)
+    x = outputs[0].reshape(batch_size1, batch_size2, -1)
+    if not return_diagnostics:
+        return (x,), out_axes
+    inertia = outputs[1].reshape(batch_size1, batch_size2, 2)
     
-    return (x, inertia), (0, 0)
+    return (x, inertia), out_axes
+
+def solve_batch_xonly_vmap(vector_arg_values, batch_axes, **kwargs):
+    return solve_batch_vmap(vector_arg_values, batch_axes, return_diagnostics=False, **kwargs)
 
 batching.primitive_batchers[solve_batch_f32_p] = solve_batch_vmap
 batching.primitive_batchers[solve_batch_f64_p] = solve_batch_vmap
+batching.primitive_batchers[solve_batch_c64_p] = solve_batch_vmap
+batching.primitive_batchers[solve_batch_c128_p] = solve_batch_vmap
+batching.primitive_batchers[solve_batch_f32_xonly_p] = solve_batch_xonly_vmap
+batching.primitive_batchers[solve_batch_f64_xonly_p] = solve_batch_xonly_vmap
+batching.primitive_batchers[solve_batch_c64_xonly_p] = solve_batch_xonly_vmap
+batching.primitive_batchers[solve_batch_c128_xonly_p] = solve_batch_xonly_vmap
 batching.primitive_batchers[solve_pbatch_f32_p] = solve_batch_vmap
 batching.primitive_batchers[solve_pbatch_f64_p] = solve_batch_vmap
+batching.primitive_batchers[solve_pbatch_c64_p] = solve_batch_vmap
+batching.primitive_batchers[solve_pbatch_c128_p] = solve_batch_vmap
+batching.primitive_batchers[solve_pbatch_f32_xonly_p] = solve_batch_xonly_vmap
+batching.primitive_batchers[solve_pbatch_f64_xonly_p] = solve_batch_xonly_vmap
+batching.primitive_batchers[solve_pbatch_c64_xonly_p] = solve_batch_xonly_vmap
+batching.primitive_batchers[solve_pbatch_c128_xonly_p] = solve_batch_xonly_vmap
 
 # create python side composable class to ensure validity of the columns and offsets
 class CuDSSSolver(eqx.Module):
@@ -786,13 +1074,23 @@ class CuDSSSolver(eqx.Module):
     device_id: int = eqx.field(static=True)
     mtype_id: int = eqx.field(static=True)
     mview_id: int = eqx.field(static=True)
+    return_diagnostics: bool = eqx.field(static=True)
 
-    def __init__(self, csr_offsets, csr_columns, device_id, mtype_id, mview_id):
+    def __init__(
+        self,
+        csr_offsets,
+        csr_columns,
+        device_id,
+        mtype_id,
+        mview_id,
+        return_diagnostics: bool = True,
+    ):
         self.csr_offsets = csr_offsets
         self.csr_columns = csr_columns
         self.device_id = device_id
         self.mtype_id = mtype_id
         self.mview_id = mview_id
+        self.return_diagnostics = bool(return_diagnostics)
 
     def __call__(self, b, csr_values):
         return solve(b, csr_values,
@@ -800,6 +1098,6 @@ class CuDSSSolver(eqx.Module):
             csr_columns=self.csr_columns,
             device_id=self.device_id,
             mtype_id=self.mtype_id,
-            mview_id=self.mview_id
-        )   
-        1
+            mview_id=self.mview_id,
+            return_diagnostics=self.return_diagnostics,
+        )

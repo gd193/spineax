@@ -5,6 +5,7 @@
 #include <vector>
 #include <complex>
 #include <type_traits>
+#include <string>
 // #include <cuComplex.h> // For device-side complex number operations
 
 #include "cuda_runtime_api.h"
@@ -21,7 +22,8 @@ namespace nb = nanobind;
         status = call; \
         if (status != CUDSS_STATUS_SUCCESS) { \
             printf("FAILED: CUDSS call ended unsuccessfully with status = %d, details: " #msg "\n", status); \
-            return ffi::Error::Success(); \
+            return ffi::Error::Internal(std::string("cuDSS call failed with status ") + \
+                std::to_string(status) + ": " #msg); \
         } \
     } while(0);
 
@@ -31,7 +33,16 @@ namespace nb = nanobind;
     if (err != cudaSuccess) {                                  \
       printf("CUDA Error at %s %d: %s\n", __FILE__, __LINE__,   \
              cudaGetErrorString(err));                         \
-      return ffi::Error::Internal("A CUDA call failed.");      \
+      return ffi::Error::Internal(std::string("CUDA call failed: ") + cudaGetErrorString(err)); \
+    }                                                          \
+  } while (0)
+
+#define CUDA_LOG_IF_ERROR(call)                                \
+  do {                                                         \
+    cudaError_t err = call;                                    \
+    if (err != cudaSuccess) {                                  \
+      printf("CUDA Error at %s %d: %s\n", __FILE__, __LINE__,   \
+             cudaGetErrorString(err));                         \
     }                                                          \
   } while (0)
 
@@ -40,7 +51,8 @@ namespace nb = nanobind;
         status = call; \
         if (status != CUDSS_STATUS_SUCCESS) { \
             printf("FAILED: CUDSS call ended unsuccessfully with status = %d, details: " #msg "\n", status); \
-            return ffi::Error::Success(); \
+            return ffi::Error::Internal(std::string("cuDSS call failed with status ") + \
+                std::to_string(status) + ": " #msg); \
         } else { \
             int info_temp; \
             size_t size_written_temp; \
@@ -74,12 +86,12 @@ void print_device_data(
     std::vector<T> host_data(total_elements);
 
     // Copy all data from GPU to CPU in one go
-    cudaMemcpy(
+    CUDA_LOG_IF_ERROR(cudaMemcpy(
         host_data.data(),
         device_ptr,
         total_elements * sizeof(T),
         cudaMemcpyDeviceToHost
-    );
+    ));
 
     // Loop through each batch and print its contents
     for (size_t i = 0; i < n_batch; ++i) {

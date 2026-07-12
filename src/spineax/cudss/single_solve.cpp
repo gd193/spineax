@@ -5,6 +5,7 @@
 #include <vector>
 #include <complex>
 #include <type_traits>
+#include <string>
 // #include <cuComplex.h> // For device-side complex number operations - not needed now that I am not writing kernels
 
 #include "cuda_runtime_api.h"
@@ -21,7 +22,8 @@ namespace nb = nanobind;
         status = call; \
         if (status != CUDSS_STATUS_SUCCESS) { \
             printf("FAILED: CUDSS call ended unsuccessfully with status = %d, details: " #msg "\n", status); \
-            return ffi::Error::Success(); \
+            return ffi::Error::Internal(std::string("cuDSS call failed with status ") + \
+                std::to_string(status) + ": " #msg); \
         } \
     } while(0);
 
@@ -31,7 +33,16 @@ namespace nb = nanobind;
     if (err != cudaSuccess) {                                  \
       printf("CUDA Error at %s %d: %s\n", __FILE__, __LINE__,   \
              cudaGetErrorString(err));                         \
-      return ffi::Error::Internal("A CUDA call failed.");      \
+      return ffi::Error::Internal(std::string("CUDA call failed: ") + cudaGetErrorString(err)); \
+    }                                                          \
+  } while (0)
+
+#define CUDA_LOG_IF_ERROR(call)                                \
+  do {                                                         \
+    cudaError_t err = call;                                    \
+    if (err != cudaSuccess) {                                  \
+      printf("CUDA Error at %s %d: %s\n", __FILE__, __LINE__,   \
+             cudaGetErrorString(err));                         \
     }                                                          \
   } while (0)
 
@@ -54,12 +65,12 @@ void print_device_data(
     std::vector<T> host_data(total_elements);
 
     // Copy all data from GPU to CPU in one go
-    cudaMemcpy(
+    CUDA_LOG_IF_ERROR(cudaMemcpy(
         host_data.data(),
         device_ptr,
         total_elements * sizeof(T),
         cudaMemcpyDeviceToHost
-    );
+    ));
 
     // Loop through each batch and print its contents
     for (size_t i = 0; i < n_batch; ++i) {
@@ -251,15 +262,15 @@ static ffi::Error CudssExecute(
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
 
         // cold solve - analyze, factorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
-        
+
         state->call_count++;
     }
     else {
@@ -277,10 +288,10 @@ static ffi::Error CudssExecute(
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
 
         // warm solve - refactorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
 
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE, 
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
     }
 
@@ -299,6 +310,91 @@ static ffi::Error CudssExecute(
     if (state->status != CUDSS_STATUS_SUCCESS) {
         // Zero out the perm buffer on failure
         CUDA_CHECK(cudaMemset(perm_buf->typed_data(), 0, state->n * sizeof(int32_t)));
+    }
+
+    return ffi::Error::Success();
+}
+
+template <ffi::DataType T>
+static ffi::Error CudssExecuteXOnly(
+    cudaStream_t stream,
+    CudssState<T>* state,
+    ffi::Buffer<T> b_values_buf,
+    ffi::Buffer<T> csr_values_buf,
+    ffi::Buffer<ffi::S32> offsets_buf,
+    ffi::Buffer<ffi::S32> columns_buf,
+    ffi::ResultBuffer<T> out_values_buf,
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id
+) {
+
+    // Track stream for cleanup synchronization
+    state->last_stream = stream;
+
+    // instantiate system branch
+    if (state->call_count == 0) {
+
+        // figure this out on first call
+        state->n = offsets_buf.element_count() - 1;
+        state->nnz = columns_buf.element_count();
+
+        // CuDSS setup
+        CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+        CUDSS_CALL_AND_CHECK(cudssConfigCreate(&state->config), state->status, "cudssConfigCreate");
+        CUDSS_CALL_AND_CHECK(cudssDataCreate(state->handle, &state->data), state->status, "cudssDataCreate");
+
+        // CuDSS structures creation
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, state->n, state->nrhs, state->n,
+            b_values_buf.typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, state->n, state->nrhs, state->n,
+            out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, state->n, state->n, state->nnz,
+            offsets_buf.typed_data(), NULL,
+            columns_buf.typed_data(),
+            csr_values_buf.typed_data(),
+            CUDA_R_32I, state->cuda_dtype,
+            state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
+
+        // CuDSS config
+        // iterative refinement of the soln is pretty n i f t y
+        int iter_ref_nsteps = 5; // 5
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+
+        // cold solve - analyze, factorize, solve
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+
+        state->call_count++;
+    }
+    else {
+        // stream can change between calls!!!
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetCsrPointers(state->A,
+            offsets_buf.typed_data(), NULL,
+            columns_buf.typed_data(),
+            csr_values_buf.typed_data()), state->status, "update_pointers A");
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
+
+        // warm solve - refactorize, solve
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
     }
 
     return ffi::Error::Success();
@@ -325,6 +421,19 @@ static ffi::Error CudssExecute(
             .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id")); \
+    \
+    XLA_FFI_DEFINE_HANDLER(kCudssExecuteXOnly##TypeName, CudssExecuteXOnly<DataType>, \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
+            .Ctx<ffi::State<CudssState<DataType>>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<DataType>>() \
             .Attr<int64_t>("device_id") \
             .Attr<int64_t>("mtype_id") \
             .Attr<int64_t>("mview_id"));
@@ -362,6 +471,12 @@ DEFINE_CUDSS_FFI_HANDLERS(c128, ffi::C128);
         nb::dict d; \
         d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
         d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecute##TypeName)); \
+        return d; \
+    }); \
+    m.def("handler_xonly_" #TypeName, []() { \
+        nb::dict d; \
+        d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
+        d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecuteXOnly##TypeName)); \
         return d; \
     });
 
