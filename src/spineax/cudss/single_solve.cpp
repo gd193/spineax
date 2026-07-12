@@ -124,16 +124,18 @@ struct CudssState {
     int64_t call_count = 0; // necessary for detecting if we need further instantiation in execution stage
     size_t sizeWritten = 0;
     cudaDataType cuda_dtype = get_cuda_data_type<T>();
-
-    // this is literally only for debugging
     using native_dtype = typename get_native_data_type<T>::type;
+    native_dtype* owned_csr_values = nullptr;
+    size_t owned_csr_values_bytes = 0;
 
     ~CudssState() {
+        if (last_stream) {
+            cudaStreamSynchronize(last_stream);
+        }
+        if (owned_csr_values) {
+            cudaFree(owned_csr_values);
+        }
         if (handle) {
-            // Synchronize with the last stream before destroying resources
-            if (last_stream) {
-                cudaStreamSynchronize(last_stream);
-            }
             cudssMatrixDestroy(A);
             cudssMatrixDestroy(b);
             cudssMatrixDestroy(x);
@@ -415,6 +417,183 @@ static ffi::Error CudssExecuteXOnly(
     return ffi::Error::Success();
 }
 
+template <ffi::DataType T>
+static ffi::Error CudssExecuteConstantXOnly(
+    cudaStream_t stream,
+    CudssState<T>* state,
+    ffi::Buffer<T> b_values_buf,
+    ffi::Buffer<T> csr_values_buf,
+    ffi::Buffer<ffi::S32> offsets_buf,
+    ffi::Buffer<ffi::S32> columns_buf,
+    ffi::ResultBuffer<T> out_values_buf,
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id
+) {
+    state->last_stream = stream;
+
+    if (state->call_count == 0) {
+        state->n = offsets_buf.element_count() - 1;
+        state->nnz = columns_buf.element_count();
+        state->nrhs = 1;
+        state->owned_csr_values_bytes = state->nnz * sizeof(typename CudssState<T>::native_dtype);
+        CUDA_CHECK(cudaMallocAsync(
+            reinterpret_cast<void**>(&state->owned_csr_values),
+            state->owned_csr_values_bytes,
+            stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            state->owned_csr_values,
+            csr_values_buf.typed_data(),
+            state->owned_csr_values_bytes,
+            cudaMemcpyDeviceToDevice,
+            stream));
+
+        CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+        CUDSS_CALL_AND_CHECK(cudssConfigCreate(&state->config), state->status, "cudssConfigCreate");
+        CUDSS_CALL_AND_CHECK(cudssDataCreate(state->handle, &state->data), state->status, "cudssDataCreate");
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, state->n, state->nrhs, state->n,
+            b_values_buf.typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for b");
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, state->n, state->nrhs, state->n,
+            out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for x");
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, state->n, state->n, state->nnz,
+            offsets_buf.typed_data(), NULL,
+            columns_buf.typed_data(),
+            state->owned_csr_values,
+            CUDA_R_32I, state->cuda_dtype,
+            state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
+
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+        state->call_count++;
+        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
+            printf("constant xonly cudss: factorized once\n");
+        }
+    } else {
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetCsrPointers(state->A,
+            offsets_buf.typed_data(), NULL,
+            columns_buf.typed_data(),
+            state->owned_csr_values), state->status, "update_pointers A");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
+            printf("constant xonly cudss: solve-only warm call\n");
+        }
+    }
+
+    return ffi::Error::Success();
+}
+
+/* Constant-matrix multi-RHS x-only solve.
+ *
+ * b_values_buf/out_values_buf are logical JAX arrays of shape (nrhs, n). JAX's
+ * default row-major physical layout stores each RHS row contiguously. cuDSS is
+ * given the same pointer as a column-major dense matrix with n rows, nrhs
+ * columns, and ld=n, so each contiguous row becomes one RHS column. This avoids
+ * explicit transposes/copies while solving A X = B with one factorization.
+ */
+template <ffi::DataType T>
+static ffi::Error CudssExecuteConstantMultiRHSXOnly(
+    cudaStream_t stream,
+    CudssState<T>* state,
+    ffi::Buffer<T> b_values_buf,
+    ffi::Buffer<T> csr_values_buf,
+    ffi::Buffer<ffi::S32> offsets_buf,
+    ffi::Buffer<ffi::S32> columns_buf,
+    ffi::ResultBuffer<T> out_values_buf,
+    const int64_t device_id,
+    const int64_t mtype_id,
+    const int64_t mview_id
+) {
+    state->last_stream = stream;
+
+    const int64_t n = offsets_buf.element_count() - 1;
+    if (n <= 0 || b_values_buf.element_count() % n != 0) {
+        return ffi::Error::Internal("constant multi-RHS cuDSS expected RHS shape (nrhs, n)");
+    }
+    const int64_t nrhs = b_values_buf.element_count() / n;
+
+    if (state->call_count == 0) {
+        state->n = n;
+        state->nnz = columns_buf.element_count();
+        state->nrhs = nrhs;
+        state->owned_csr_values_bytes = state->nnz * sizeof(typename CudssState<T>::native_dtype);
+        CUDA_CHECK(cudaMallocAsync(
+            reinterpret_cast<void**>(&state->owned_csr_values),
+            state->owned_csr_values_bytes,
+            stream));
+        CUDA_CHECK(cudaMemcpyAsync(
+            state->owned_csr_values,
+            csr_values_buf.typed_data(),
+            state->owned_csr_values_bytes,
+            cudaMemcpyDeviceToDevice,
+            stream));
+
+        CUDSS_CALL_AND_CHECK(cudssCreate(&state->handle), state->status, "cudssCreate");
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+        CUDSS_CALL_AND_CHECK(cudssConfigCreate(&state->config), state->status, "cudssConfigCreate");
+        CUDSS_CALL_AND_CHECK(cudssDataCreate(state->handle, &state->data), state->status, "cudssDataCreate");
+
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->b, state->n, state->nrhs, state->n,
+            b_values_buf.typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for multi-RHS b");
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateDn(&state->x, state->n, state->nrhs, state->n,
+            out_values_buf->typed_data(), state->cuda_dtype, CUDSS_LAYOUT_COL_MAJOR), state->status, "cudssMatrixCreateDn for multi-RHS x");
+        CUDSS_CALL_AND_CHECK(cudssMatrixCreateCsr(&state->A, state->n, state->n, state->nnz,
+            offsets_buf.typed_data(), NULL,
+            columns_buf.typed_data(),
+            state->owned_csr_values,
+            CUDA_R_32I, state->cuda_dtype,
+            state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
+
+        int iter_ref_nsteps = cudss_ir_nsteps();
+        CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
+                            &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+        state->call_count++;
+        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
+            printf("constant multi-RHS xonly cudss: factorized once with nrhs=%ld\n", static_cast<long>(state->nrhs));
+        }
+    } else {
+        if (state->n != n || state->nrhs != nrhs) {
+            return ffi::Error::Internal("constant multi-RHS cuDSS compiled state called with changed shape");
+        }
+        CUDSS_CALL_AND_CHECK(cudssSetStream(state->handle, stream), state->status, "cudssSetStream");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetCsrPointers(state->A,
+            offsets_buf.typed_data(), NULL,
+            columns_buf.typed_data(),
+            state->owned_csr_values), state->status, "update_pointers A");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
+        CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
+        if (std::getenv("SPINEAX_CUDSS_DEBUG")) {
+            printf("constant multi-RHS xonly cudss: solve-only warm call with nrhs=%ld\n", static_cast<long>(state->nrhs));
+        }
+    }
+
+    return ffi::Error::Success();
+}
+
 // minimize XLA/nanobind boilerplate with a couple macros ======================
 
 // XLA ffi handler definitions for all datatypes
@@ -440,6 +619,32 @@ static ffi::Error CudssExecuteXOnly(
             .Attr<int64_t>("mview_id")); \
     \
     XLA_FFI_DEFINE_HANDLER(kCudssExecuteXOnly##TypeName, CudssExecuteXOnly<DataType>, \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
+            .Ctx<ffi::State<CudssState<DataType>>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<DataType>>() \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id")); \
+    \
+    XLA_FFI_DEFINE_HANDLER(kCudssExecuteConstantXOnly##TypeName, CudssExecuteConstantXOnly<DataType>, \
+        ffi::Ffi::Bind() \
+            .Ctx<ffi::PlatformStream<cudaStream_t>>() \
+            .Ctx<ffi::State<CudssState<DataType>>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<DataType>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Arg<ffi::Buffer<ffi::S32>>() \
+            .Ret<ffi::Buffer<DataType>>() \
+            .Attr<int64_t>("device_id") \
+            .Attr<int64_t>("mtype_id") \
+            .Attr<int64_t>("mview_id")); \
+    \
+    XLA_FFI_DEFINE_HANDLER(kCudssExecuteConstantMultiRHSXOnly##TypeName, CudssExecuteConstantMultiRHSXOnly<DataType>, \
         ffi::Ffi::Bind() \
             .Ctx<ffi::PlatformStream<cudaStream_t>>() \
             .Ctx<ffi::State<CudssState<DataType>>>() \
@@ -491,6 +696,18 @@ DEFINE_CUDSS_FFI_HANDLERS(c128, ffi::C128);
         nb::dict d; \
         d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
         d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecuteXOnly##TypeName)); \
+        return d; \
+    }); \
+    m.def("handler_const_xonly_" #TypeName, []() { \
+        nb::dict d; \
+        d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
+        d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecuteConstantXOnly##TypeName)); \
+        return d; \
+    }); \
+    m.def("handler_const_multi_rhs_xonly_" #TypeName, []() { \
+        nb::dict d; \
+        d["instantiate"] = nb::capsule(reinterpret_cast<void*>(kCudssInstantiate##TypeName)); \
+        d["execute"] = nb::capsule(reinterpret_cast<void*>(kCudssExecuteConstantMultiRHSXOnly##TypeName)); \
         return d; \
     });
 

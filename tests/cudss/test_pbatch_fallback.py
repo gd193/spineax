@@ -51,6 +51,41 @@ class TestPbatchAvailable:
         assert inertia[0] == 5, f"Expected positive inertia 5, got {inertia[0]}"
         assert inertia[1] == 0, f"Expected negative inertia 0, got {inertia[1]}"
 
+    def test_solution_only_vmap_lowers_to_pbatch_xonly(self):
+        """Dynamic solution-only vmap keeps the pbatch x-only custom call."""
+        from spineax.cudss.solver import CuDSSSolver
+
+        csr_offsets, csr_columns, csr_values, b, _ = get_test_system()
+        solver = CuDSSSolver(csr_offsets, csr_columns, 0, 1, 1, return_diagnostics=False)
+        b_batch = jnp.stack([b, b * 2, b * 0.5])
+        csr_batch = jnp.stack([csr_values, csr_values, csr_values])
+
+        @jax.jit
+        def solve_batch(rhs_batch, values_batch):
+            return jax.vmap(lambda bi, vi: solver(bi, vi)[0])(rhs_batch, values_batch)
+
+        lowered = solve_batch.lower(b_batch, csr_batch).as_text()
+        assert "solve_pbatch_f32_xonly" in lowered
+        assert "solve_batch_f32_xonly" not in lowered
+        assert "solve_pbatch_f32\"" not in lowered
+
+    def test_diagnostic_vmap_lowers_to_pbatch_diagnostics(self):
+        """Dynamic diagnostic vmap keeps the diagnostic pbatch custom call."""
+        from spineax.cudss.solver import CuDSSSolver
+
+        csr_offsets, csr_columns, csr_values, b, _ = get_test_system()
+        solver = CuDSSSolver(csr_offsets, csr_columns, 0, 1, 1)
+        b_batch = jnp.stack([b, b * 2])
+        csr_batch = jnp.stack([csr_values, csr_values])
+
+        @jax.jit
+        def solve_batch(rhs_batch, values_batch):
+            return jax.vmap(solver)(rhs_batch, values_batch)
+
+        lowered = solve_batch.lower(b_batch, csr_batch).as_text()
+        assert "solve_pbatch_f32" in lowered
+        assert "solve_pbatch_f32_xonly" not in lowered
+
     def test_solution_only_static_flag(self):
         """return_diagnostics=False returns only x and supports pbatch vmap."""
         from spineax.cudss.solver import CuDSSSolver
