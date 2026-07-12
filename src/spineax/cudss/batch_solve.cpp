@@ -261,7 +261,10 @@ static ffi::Error CudssExecute(
         int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
-        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
+        {
+            ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
+            if (env_error.failure()) return env_error;
+        }
 
         // cold solve - analyze, factorize, solve
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
@@ -394,7 +397,10 @@ static ffi::Error CudssExecuteXOnly(
         int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
-        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
+        {
+            ffi::Error env_error = cudss_apply_env_options_or_error(state->config);
+            if (env_error.failure()) return env_error;
+        }
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");

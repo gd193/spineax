@@ -27,60 +27,109 @@ static std::string cudss_normalize_env_value(const char* raw) {
     return value;
 }
 
-static bool cudss_parse_alg_env(const char* name, cudssAlgType_t* out) {
+struct CudssEnvAlgOption {
+    bool should_set = false;
+    cudssAlgType_t value = CUDSS_ALG_DEFAULT;
+    std::string error;
+};
+
+struct CudssEnvBoolOption {
+    bool should_set = false;
+    int value = 0;
+    std::string error;
+};
+
+static CudssEnvAlgOption cudss_parse_alg_env(const char* name) {
+    CudssEnvAlgOption result;
     const char* raw = std::getenv(name);
-    if (raw == nullptr || raw[0] == '\0') return false;
+    if (raw == nullptr) return result;
     std::string value = cudss_normalize_env_value(raw);
-    if (value == "default" || value == "alg_default" || value == "0") {
-        *out = CUDSS_ALG_DEFAULT;
-        return true;
+    if (value.empty() || value == "default" || value == "alg_default") return result;
+    if (value == "0") {
+        result.should_set = true;
+        result.value = CUDSS_ALG_DEFAULT;
+        return result;
     }
     if (value.rfind("alg_", 0) == 0) {
         value = value.substr(4);
     }
     char* end = nullptr;
     long alg = std::strtol(value.c_str(), &end, 10);
-    if (end == value.c_str() || *end != '\0') return false;
-    switch (alg) {
-        case 1: *out = CUDSS_ALG_1; return true;
-        case 2: *out = CUDSS_ALG_2; return true;
-        case 3: *out = CUDSS_ALG_3; return true;
-        case 4: *out = CUDSS_ALG_4; return true;
-        case 5: *out = CUDSS_ALG_5; return true;
-        default: return false;
+    if (end == value.c_str() || *end != '\0') {
+        result.error = std::string("Invalid ") + name + " value '" + raw +
+                       "'. Accepted values: unset, empty, default, 0, 1, 2, 3, 4, 5, alg_1, alg_2, alg_3, alg_4, alg_5.";
+        return result;
     }
+    switch (alg) {
+        case 1: result.value = CUDSS_ALG_1; break;
+        case 2: result.value = CUDSS_ALG_2; break;
+        case 3: result.value = CUDSS_ALG_3; break;
+        case 4: result.value = CUDSS_ALG_4; break;
+        case 5: result.value = CUDSS_ALG_5; break;
+        default:
+            result.error = std::string("Invalid ") + name + " value '" + raw +
+                           "'. Accepted values: unset, empty, default, 0, 1, 2, 3, 4, 5, alg_1, alg_2, alg_3, alg_4, alg_5.";
+            return result;
+    }
+    result.should_set = true;
+    return result;
 }
 
-static bool cudss_parse_bool_env(const char* name, int* out) {
+static CudssEnvBoolOption cudss_parse_bool_env(const char* name) {
+    CudssEnvBoolOption result;
     const char* raw = std::getenv(name);
-    if (raw == nullptr || raw[0] == '\0') return false;
+    if (raw == nullptr) return result;
     std::string value = cudss_normalize_env_value(raw);
+    if (value.empty() || value == "default") return result;
     if (value == "1" || value == "true" || value == "yes" || value == "on") {
-        *out = 1;
-        return true;
+        result.should_set = true;
+        result.value = 1;
+        return result;
     }
     if (value == "0" || value == "false" || value == "no" || value == "off") {
-        *out = 0;
-        return true;
+        result.should_set = true;
+        result.value = 0;
+        return result;
     }
-    return false;
+    result.error = std::string("Invalid ") + name + " value '" + raw +
+                   "'. Accepted values: unset, empty, default, 0, 1, false, true, no, yes, off, on.";
+    return result;
 }
 
-static cudssStatus_t cudss_apply_env_options(cudssConfig_t config) {
+static xla::ffi::Error cudss_apply_env_options_or_error(cudssConfig_t config) {
     cudssStatus_t status = CUDSS_STATUS_SUCCESS;
-    cudssAlgType_t alg;
-    if (cudss_parse_alg_env("SPINEAX_CUDSS_REORDERING_ALG", &alg)) {
-        status = cudssConfigSet(config, CUDSS_CONFIG_REORDERING_ALG, &alg, sizeof(alg));
-        if (status != CUDSS_STATUS_SUCCESS) return status;
+    CudssEnvAlgOption alg = cudss_parse_alg_env("SPINEAX_CUDSS_REORDERING_ALG");
+    if (!alg.error.empty()) return xla::ffi::Error::InvalidArgument(alg.error);
+    if (alg.should_set) {
+        status = cudssConfigSet(config, CUDSS_CONFIG_REORDERING_ALG, &alg.value, sizeof(alg.value));
+        if (status != CUDSS_STATUS_SUCCESS) {
+            return xla::ffi::Error::Internal(
+                std::string("cuDSS call failed with status ") + std::to_string(status) +
+                ": cudssConfigSet SPINEAX_CUDSS_REORDERING_ALG");
+        }
     }
-    if (cudss_parse_alg_env("SPINEAX_CUDSS_FACTORIZATION_ALG", &alg)) {
-        status = cudssConfigSet(config, CUDSS_CONFIG_FACTORIZATION_ALG, &alg, sizeof(alg));
-        if (status != CUDSS_STATUS_SUCCESS) return status;
+
+    alg = cudss_parse_alg_env("SPINEAX_CUDSS_FACTORIZATION_ALG");
+    if (!alg.error.empty()) return xla::ffi::Error::InvalidArgument(alg.error);
+    if (alg.should_set) {
+        status = cudssConfigSet(config, CUDSS_CONFIG_FACTORIZATION_ALG, &alg.value, sizeof(alg.value));
+        if (status != CUDSS_STATUS_SUCCESS) {
+            return xla::ffi::Error::Internal(
+                std::string("cuDSS call failed with status ") + std::to_string(status) +
+                ": cudssConfigSet SPINEAX_CUDSS_FACTORIZATION_ALG");
+        }
     }
-    int deterministic = 0;
-    if (cudss_parse_bool_env("SPINEAX_CUDSS_DETERMINISTIC_MODE", &deterministic)) {
-        status = cudssConfigSet(config, CUDSS_CONFIG_DETERMINISTIC_MODE, &deterministic, sizeof(deterministic));
-        if (status != CUDSS_STATUS_SUCCESS) return status;
+
+    CudssEnvBoolOption deterministic = cudss_parse_bool_env("SPINEAX_CUDSS_DETERMINISTIC_MODE");
+    if (!deterministic.error.empty()) return xla::ffi::Error::InvalidArgument(deterministic.error);
+    if (deterministic.should_set) {
+        status = cudssConfigSet(config, CUDSS_CONFIG_DETERMINISTIC_MODE,
+                                &deterministic.value, sizeof(deterministic.value));
+        if (status != CUDSS_STATUS_SUCCESS) {
+            return xla::ffi::Error::Internal(
+                std::string("cuDSS call failed with status ") + std::to_string(status) +
+                ": cudssConfigSet SPINEAX_CUDSS_DETERMINISTIC_MODE");
+        }
     }
-    return status;
+    return xla::ffi::Error::Success();
 }
