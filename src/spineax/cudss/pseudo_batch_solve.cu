@@ -13,6 +13,7 @@ they officially support it
 (I previously made this file .cu just so cmakelists sees that it needs nvcc for the summation kernel)
 */
 
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -25,6 +26,7 @@ they officially support it
 #include "nanobind/nanobind.h"
 #include "xla/ffi/api/ffi.h"
 #include "cudss.h"
+#include "cudss_env_options.h"
 
 namespace ffi = xla::ffi;
 namespace nb = nanobind;
@@ -365,9 +367,10 @@ static ffi::Error CudssExecute(
 
         // CuDSS config
         // iterative refinement of the soln is pretty n i f t y
-        int iter_ref_nsteps = 5;
+        int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
 
         // cold solve - analyze, factorize, solve
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
@@ -481,9 +484,10 @@ static ffi::Error CudssExecuteXOnly(
             CUDA_R_32I, state->cuda_dtype,
             state->mtype, state->mview, state->base), state->status, "cudssMatrixCreateCsr");
 
-        int iter_ref_nsteps = 5;
+        int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");

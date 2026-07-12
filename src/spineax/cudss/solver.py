@@ -190,13 +190,12 @@ def general_single_solve_impl(
         name,
         (
             jax.ShapeDtypeStruct(b_values.shape, b_values.dtype),   # x
-            jax.ShapeDtypeStruct(b_values.shape, b_values.dtype),   # diag
-            jax.ShapeDtypeStruct(b_values.shape, jnp.int32),        # perm_reorder_row
+            jax.ShapeDtypeStruct((2,), jnp.int32),                  # inertia [positive, negative]
         ),
         has_side_effect=True
     )
 
-    x, diag, perm = call(
+    x, inertia = call(
         b_values, 
         csr_values, 
         csr_offsets,
@@ -206,11 +205,7 @@ def general_single_solve_impl(
         mview_id = mview_id,
     )
 
-    # Compute inertia instead of returning diag and perm
-    batch_size = 1
-    matrix_dim = b_values.shape[0]
-    inertia = compute_inertia_from_diag_perm(diag, perm, batch_size, matrix_dim)
-    return [x, inertia[0]]  # Return solution and inertia for single batch
+    return [x, inertia]
 
 
 def general_single_solve_xonly_impl(

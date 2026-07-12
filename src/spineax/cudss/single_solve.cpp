@@ -1,5 +1,6 @@
 /*Standard single solve*/
 
+#include <cstdlib>
 #include <cstdint>
 #include <memory>
 #include <vector>
@@ -12,6 +13,7 @@
 #include "nanobind/nanobind.h"
 #include "xla/ffi/api/ffi.h"
 #include "cudss.h"
+#include "cudss_env_options.h"
 
 namespace ffi = xla::ffi;
 namespace nb = nanobind;
@@ -218,8 +220,7 @@ static ffi::Error CudssExecute(
     ffi::Buffer<ffi::S32> offsets_buf,
     ffi::Buffer<ffi::S32> columns_buf,
     ffi::ResultBuffer<T> out_values_buf,    // the output buffer we write the answer to
-    ffi::ResultBuffer<T> diag_buf,          // the output buffer we write the answer to
-    ffi::ResultBuffer<ffi::S32> perm_buf,   // the output buffer we write the answer to
+    ffi::ResultBuffer<ffi::S32> inertia_buf,// the output buffer we write inertia diagnostics to
     const int64_t device_id,                // the device to run this on
     const int64_t mtype_id,                 // {0: gen, 1: sym, 2: herm, 3: spd, 4: hpd}
     const int64_t mview_id                  // {0: full, 1: triu, 2: tril}
@@ -257,9 +258,10 @@ static ffi::Error CudssExecute(
 
         // CuDSS config
         // iterative refinement of the soln is pretty n i f t y
-        int iter_ref_nsteps = 5; // 5
+        int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
 
         // cold solve - analyze, factorize, solve
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
@@ -287,30 +289,36 @@ static ffi::Error CudssExecute(
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->b, b_values_buf.typed_data()), state->status, "update_pointers b");
         CUDSS_CALL_AND_CHECK(cudssMatrixSetValues(state->x, out_values_buf->typed_data()), state->status, "update_pointers x");
 
-        // warm solve - refactorize, solve
-        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_REFACTORIZATION,
-            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute refactorization");
+        // warm solve - re-run analysis/factorization/solve. The diagnostic
+        // single-solve path is sequence-sensitive with REFACTORIZATION under
+        // repeated JAX FFI calls; keep solution-only fast and make diagnostics
+        // robust.
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute analysis");
+
+        CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_FACTORIZATION,
+            state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute factorization");
 
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_SOLVE,
             state->config, state->data, state->A, state->x, state->b), state->status, "cudssExecute solve");
     }
 
-    // Diagnostic extraction - these can fail for certain matrix types (e.g., general non-SPD)
-    // Don't fail the solve, just warn and continue with zeros
-    state->status = cudssDataGet(state->handle, state->data, CUDSS_DATA_DIAG, diag_buf->typed_data(),
-                    state->n * sizeof(typename get_native_data_type<T>::type), &state->sizeWritten);
-    if (state->status != CUDSS_STATUS_SUCCESS) {
-        // Zero out the diag buffer on failure
-        CUDA_CHECK(cudaMemset(diag_buf->typed_data(), 0,
-                    state->n * sizeof(typename get_native_data_type<T>::type)));
+    // Diagnostic extraction - these can fail for certain matrix types (e.g., general non-SPD).
+    // Don't fail the solve, just continue with zeros. Query cuDSS inertia directly
+    // instead of fetching DIAG/PERM_REORDER_ROW and reconstructing it in JAX.
+    // FFI result buffers are device buffers, so copy/zero the inertia result on
+    // XLA's stream and synchronize before the stack host buffer goes out of scope.
+    int32_t inertia_host[2] = {0, 0};
+    state->status = cudssDataGet(state->handle, state->data, CUDSS_DATA_INERTIA,
+                    inertia_host, sizeof(inertia_host), &state->sizeWritten);
+    if (state->status == CUDSS_STATUS_SUCCESS) {
+        CUDA_CHECK(cudaMemcpyAsync(inertia_buf->typed_data(), inertia_host,
+                    sizeof(inertia_host), cudaMemcpyHostToDevice, stream));
+    } else {
+        CUDA_CHECK(cudaMemsetAsync(inertia_buf->typed_data(), 0,
+                    sizeof(inertia_host), stream));
     }
-
-    state->status = cudssDataGet(state->handle, state->data, CUDSS_DATA_PERM_REORDER_ROW, perm_buf->typed_data(),
-                    state->n * sizeof(int32_t), &state->sizeWritten);
-    if (state->status != CUDSS_STATUS_SUCCESS) {
-        // Zero out the perm buffer on failure
-        CUDA_CHECK(cudaMemset(perm_buf->typed_data(), 0, state->n * sizeof(int32_t)));
-    }
+    CUDA_CHECK(cudaStreamSynchronize(stream));
 
     return ffi::Error::Success();
 }
@@ -361,9 +369,10 @@ static ffi::Error CudssExecuteXOnly(
 
         // CuDSS config
         // iterative refinement of the soln is pretty n i f t y
-        int iter_ref_nsteps = 5; // 5
+        int iter_ref_nsteps = cudss_ir_nsteps();
         CUDSS_CALL_AND_CHECK(cudssConfigSet(state->config, CUDSS_CONFIG_IR_N_STEPS,
                             &iter_ref_nsteps, sizeof(iter_ref_nsteps)), state->status, "cudssConfigSet ir_nsteps");
+        CUDSS_CALL_AND_CHECK(cudss_apply_env_options(state->config), state->status, "cudss_apply_env_options");
 
         // cold solve - analyze, factorize, solve
         CUDSS_CALL_AND_CHECK(cudssExecute(state->handle, CUDSS_PHASE_ANALYSIS,
@@ -418,7 +427,6 @@ static ffi::Error CudssExecuteXOnly(
             .Arg<ffi::Buffer<DataType>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
             .Arg<ffi::Buffer<ffi::S32>>() \
-            .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<DataType>>() \
             .Ret<ffi::Buffer<ffi::S32>>() \
             .Attr<int64_t>("device_id") \
