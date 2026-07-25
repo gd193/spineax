@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
-"""Benchmark factor-once constant-CSR solves against explicit token phases.
+"""Benchmark ConstantCSRCuDSSSolver against an equivalent reused FactorToken.
 
 Examples:
     CUDA_VISIBLE_DEVICES=1 python benchmarks/cudss_constant_solver.py
     CUDA_VISIBLE_DEVICES=1 python benchmarks/cudss_constant_solver.py \
         --grid-sizes 32 64 128 --nrhs 1 8 --dtype float64 --output results.json
 
-Compilation and warmup are excluded. Every timed operation is synchronized so
-results represent observed call latency rather than asynchronous dispatch time.
+The two paths perform the same factor-once/solve-many work. This benchmark asks
+whether the convenience wrapper adds setup or steady-state solve overhead; it
+does not compare solve-only latency with factorization on every call.
 """
 
 from __future__ import annotations
@@ -43,12 +44,12 @@ class Result:
     n: int
     nnz: int
     nrhs: int
-    construction: Timing
+    constant_setup: Timing
+    token_setup: Timing
     constant_solve: Timing
     token_solve: Timing
-    refactor_solve: Timing
-    refactor_speedup: float
-    wrapper_overhead_pct: float
+    setup_overhead_pct: float
+    solve_overhead_pct: float
     relative_error: float
 
 
@@ -103,59 +104,56 @@ def _timing(samples_ns: list[int]) -> Timing:
     )
 
 
-def _measure(call: Callable, rhs, warmup: int, samples: int) -> Timing:
-    # One mandatory call excludes compilation even when --warmup=0.
-    call(rhs).block_until_ready()
-    for _ in range(warmup):
-        call(rhs).block_until_ready()
-    elapsed: list[int] = []
-    for _ in range(samples):
-        start = time.perf_counter_ns()
-        call(rhs).block_until_ready()
-        elapsed.append(time.perf_counter_ns() - start)
-    return _timing(elapsed)
+def _ordered_names(names: list[str], sample: int, order_index: int) -> list[str]:
+    if (sample + order_index) % 2:
+        return list(reversed(names))
+    return names
 
 
-def _run_refactor(call: Callable, rhs):
-    solution, token = call(rhs)
-    solution.block_until_ready()
-    cudss.release(token)
-    return solution
-
-
-def _measure_refactor(call: Callable, rhs, warmup: int, samples: int) -> Timing:
-    # Release every transient token, including compilation and warmup calls.
-    _run_refactor(call, rhs)
-    for _ in range(warmup):
-        _run_refactor(call, rhs)
-    elapsed: list[int] = []
-    for _ in range(samples):
-        start = time.perf_counter_ns()
-        _run_refactor(call, rhs)
-        elapsed.append(time.perf_counter_ns() - start)
-    return _timing(elapsed)
-
-
-def _measure_construction(
-    values,
-    offsets,
-    columns,
+def _measure_paired_calls(
+    calls: dict[str, Callable],
+    rhs,
+    warmup: int,
     samples: int,
-) -> Timing:
-    # Compile both setup phases once; construction timings are steady-state.
-    warmup_solver = cudss.ConstantCSRCuDSSSolver(
-        values, offsets, columns, mtype_id="spd"
-    )
-    warmup_solver.release()
+    order_index: int,
+) -> dict[str, Timing]:
+    names = list(calls)
+    # One mandatory untimed call per path excludes JIT compilation.
+    for name in _ordered_names(names, 0, order_index):
+        calls[name](rhs).block_until_ready()
+    for index in range(warmup):
+        for name in _ordered_names(names, index + 1, order_index):
+            calls[name](rhs).block_until_ready()
 
-    elapsed: list[int] = []
-    for _ in range(samples):
-        start = time.perf_counter_ns()
-        solver = cudss.ConstantCSRCuDSSSolver(values, offsets, columns, mtype_id="spd")
-        # Construction blocks on token readiness before returning.
-        elapsed.append(time.perf_counter_ns() - start)
-        solver.release()
-    return _timing(elapsed)
+    elapsed: dict[str, list[int]] = {name: [] for name in names}
+    for sample in range(samples):
+        for name in _ordered_names(names, sample, order_index):
+            start = time.perf_counter_ns()
+            calls[name](rhs).block_until_ready()
+            elapsed[name].append(time.perf_counter_ns() - start)
+    return {name: _timing(values) for name, values in elapsed.items()}
+
+
+def _measure_paired_setups(
+    factories: dict[str, Callable],
+    releasers: dict[str, Callable],
+    samples: int,
+    order_index: int,
+) -> dict[str, Timing]:
+    names = list(factories)
+    # Compile/setup each path once. Release is intentionally outside setup time.
+    for name in _ordered_names(names, 0, order_index):
+        state = factories[name]()
+        releasers[name](state)
+
+    elapsed: dict[str, list[int]] = {name: [] for name in names}
+    for sample in range(samples):
+        for name in _ordered_names(names, sample, order_index):
+            start = time.perf_counter_ns()
+            state = factories[name]()
+            elapsed[name].append(time.perf_counter_ns() - start)
+            releasers[name](state)
+    return {name: _timing(values) for name, values in elapsed.items()}
 
 
 def _relative_error(actual, expected) -> float:
@@ -188,46 +186,39 @@ def _benchmark_case(
     rhs = jnp.asarray(rhs_np)
     expected = jnp.asarray(true_x_np)
 
-    construction = _measure_construction(values, offsets, columns, construction_samples)
-    constant_solver = cudss.ConstantCSRCuDSSSolver(
-        values, offsets, columns, mtype_id="spd"
-    )
-    token = cudss.factorize(
-        cudss.analyze(values, offsets, columns, mtype_id="spd"), values
-    )
-    token.id.block_until_ready()
+    def make_constant():
+        # The constructor blocks on its factor token before returning.
+        return cudss.ConstantCSRCuDSSSolver(values, offsets, columns, mtype_id="spd")
 
+    def make_token():
+        token = cudss.factorize(
+            cudss.analyze(values, offsets, columns, mtype_id="spd"), values
+        )
+        token.id.block_until_ready()
+        return token
+
+    setup = _measure_paired_setups(
+        {"constant": make_constant, "token": make_token},
+        {"constant": lambda solver: solver.release(), "token": cudss.release},
+        construction_samples,
+        order_index,
+    )
+
+    constant_solver = make_constant()
+    token = make_token()
     constant_call = jax.jit(lambda value: constant_solver(value))
     token_call = jax.jit(lambda value: cudss.solve(token, value))
-
-    @jax.jit
-    def refactor_call(value):
-        current = cudss.analyze(values, offsets, columns, mtype_id="spd")
-        current = cudss.factorize(current, values)
-        return cudss.solve(current, value), current
-
     try:
-        measurements = {
-            "constant": lambda: _measure(constant_call, rhs, warmup, samples),
-            "token": lambda: _measure(token_call, rhs, warmup, samples),
-            "refactor": lambda: _measure_refactor(refactor_call, rhs, warmup, samples),
-        }
-        names = ["constant", "token", "refactor"]
-        shift = order_index % len(names)
-        timings = {}
-        for name in names[shift:] + names[:shift]:
-            timings[name] = measurements[name]()
-        constant_solve = timings["constant"]
-        token_solve = timings["token"]
-        refactor_solve = timings["refactor"]
-
-        actual_constant = constant_call(rhs)
-        actual_token = token_call(rhs)
-        actual_refactor = _run_refactor(refactor_call, rhs)
+        solve = _measure_paired_calls(
+            {"constant": constant_call, "token": token_call},
+            rhs,
+            warmup,
+            samples,
+            order_index,
+        )
         errors = [
-            _relative_error(actual_constant, expected),
-            _relative_error(actual_token, expected),
-            _relative_error(actual_refactor, expected),
+            _relative_error(constant_call(rhs), expected),
+            _relative_error(token_call(rhs), expected),
         ]
         if not all(math.isfinite(value) for value in errors):
             raise RuntimeError(f"non-finite relative errors: {errors}")
@@ -241,17 +232,23 @@ def _benchmark_case(
         constant_solver.release()
         cudss.release(token)
 
+    constant_setup = setup["constant"]
+    token_setup = setup["token"]
+    constant_solve = solve["constant"]
+    token_solve = solve["token"]
     return Result(
         grid_size=grid_size,
         n=n,
         nnz=values.shape[0],
         nrhs=nrhs,
-        construction=construction,
+        constant_setup=constant_setup,
+        token_setup=token_setup,
         constant_solve=constant_solve,
         token_solve=token_solve,
-        refactor_solve=refactor_solve,
-        refactor_speedup=refactor_solve.median_ms / constant_solve.median_ms,
-        wrapper_overhead_pct=(
+        setup_overhead_pct=(
+            100.0 * (constant_setup.median_ms / token_setup.median_ms - 1.0)
+        ),
+        solve_overhead_pct=(
             100.0 * (constant_solve.median_ms / token_solve.median_ms - 1.0)
         ),
         relative_error=error,
@@ -260,20 +257,20 @@ def _benchmark_case(
 
 def _print_results(results: list[Result]) -> None:
     header = (
-        " grid    n     nnz  rhs  construct  constant  token  refactor  "
-        "speedup  wrapper   relerr"
+        " grid    n     nnz  rhs  const-setup  token-setup  setup-oh  "
+        "const-solve  token-solve  solve-oh   relerr"
     )
     print(header)
     print("-" * len(header))
     for result in results:
         print(
             f"{result.grid_size:5d} {result.n:6d} {result.nnz:7d} "
-            f"{result.nrhs:4d} {result.construction.median_ms:9.3f}ms "
-            f"{result.constant_solve.median_ms:8.3f}ms "
-            f"{result.token_solve.median_ms:6.3f}ms "
-            f"{result.refactor_solve.median_ms:8.3f}ms "
-            f"{result.refactor_speedup:7.2f}x "
-            f"{result.wrapper_overhead_pct:+7.2f}% "
+            f"{result.nrhs:4d} {result.constant_setup.median_ms:10.3f}ms "
+            f"{result.token_setup.median_ms:10.3f}ms "
+            f"{result.setup_overhead_pct:+7.2f}% "
+            f"{result.constant_solve.median_ms:10.3f}ms "
+            f"{result.token_solve.median_ms:10.3f}ms "
+            f"{result.solve_overhead_pct:+7.2f}% "
             f"{result.relative_error:.1e}"
         )
 
