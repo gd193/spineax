@@ -778,6 +778,18 @@ def test_dtype_mismatch_raises():
         cudss.factorize(token, values.astype(jnp.float32))
 
 
+def test_malformed_rhs_raises_before_ffi():
+    _require_gpu()
+    values, offsets, columns, _ = _sym_system()
+    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+    n = token.n
+
+    with pytest.raises(ValueError, match="rhs trailing dim"):
+        cudss.solve(token, jnp.ones(n - 1, dtype=values.dtype))
+    with pytest.raises(ValueError, match="rhs trailing dim"):
+        cudss.solve(token, jnp.ones((3, n - 1), dtype=values.dtype))
+
+
 def test_structure_tampering_raises():
     """A token's offsets/columns leaves are immutable by contract.
 
@@ -1296,7 +1308,109 @@ def test_lineax_general_operator():
                                rtol=1e-9, atol=1e-9)
 
 
-# lifetime =====================================================================
+# lifetime and concurrency =====================================================
+def test_failed_analyze_does_not_publish_state_and_retry_succeeds(monkeypatch):
+    _require_gpu()
+    values, offsets, columns, A = _sym_system()
+    b = jnp.asarray(np.random.default_rng(37).standard_normal(A.shape[0]))
+    # Leave spare capacity so an accidental publication cannot be hidden by
+    # simultaneously evicting an old entry while preserving the same size.
+    monkeypatch.setenv("SPINEAX_FACTOR_CACHE", "64")
+    size_before = cudss.registry_size()
+
+    with pytest.raises(Exception, match="invalid reordering_id"):
+        cudss.analyze(values, offsets, columns,
+                      reordering=9).id.block_until_ready()
+    assert cudss.registry_size() == size_before
+
+    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+    assert _rel_err(A, cudss.solve(token, b), b) < _TOL[jnp.float64]
+
+
+def test_same_shape_distinct_matrices_do_not_alias():
+    _require_gpu()
+    values, offsets, columns, A = _sym_system(seed=38)
+    b = jnp.asarray(np.random.default_rng(39).standard_normal(A.shape[0]))
+    token_a = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+    token_b = cudss.factorize(
+        cudss.analyze(2.0 * values, offsets, columns), 2.0 * values)
+
+    assert np.asarray(token_a.id)[0] != np.asarray(token_b.id)[0]
+    assert _rel_err(A, cudss.solve(token_a, b), b) < _TOL[jnp.float64]
+    assert _rel_err(2.0 * A, cudss.solve(token_b, b), b) < _TOL[jnp.float64]
+
+
+def test_concurrent_solve_and_query_same_token():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    _require_gpu()
+    values, offsets, columns, A = _sym_system(n=80, seed=40)
+    b = jnp.asarray(np.random.default_rng(41).standard_normal(A.shape[0]))
+    token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
+
+    # Compile and prepare operands before dispatching one resident
+    # factorization from synchronized host threads.
+    jax.block_until_ready((cudss.solve(token, b), cudss.query(token)))
+    scales = (0.5, 1.0, 2.0, 3.0)
+    rhs_inputs = tuple(scale * b for scale in scales)
+    barrier = Barrier(len(scales))
+
+    def use(rhs):
+        barrier.wait()
+        x = cudss.solve(token, rhs)
+        inertia = cudss.inertia(cudss.query(token))
+        x, inertia = jax.block_until_ready((x, inertia))
+        for _ in range(2):
+            x = cudss.solve(token, rhs)
+            inertia = cudss.inertia(cudss.query(token))
+            x, inertia = jax.block_until_ready((x, inertia))
+        return x, inertia
+
+    with ThreadPoolExecutor(max_workers=len(scales)) as pool:
+        results = list(pool.map(use, rhs_inputs))
+
+    for index, scale in enumerate(scales):
+        x, inertia = results[index]
+        assert _rel_err(A, x, scale * b) < _TOL[jnp.float64]
+        np.testing.assert_array_equal(np.asarray(inertia), [A.shape[0], 0])
+
+
+def test_concurrent_batched_solves_same_token():
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    _require_gpu()
+    values, offsets, columns, A = _sym_system(n=60, seed=42)
+    scales_a = jnp.asarray([1.0, 2.0, 4.0])
+    values_batch = scales_a[:, None] * values
+    token = cudss.factorize(
+        cudss.analyze(values_batch, offsets, columns), values_batch)
+    rhs = jnp.asarray(
+        np.random.default_rng(43).standard_normal((3, A.shape[0])))
+
+    cudss.solve(token, rhs).block_until_ready()
+    rhs_scales = (0.5, 1.0, 2.0, 3.0)
+    rhs_inputs = tuple(scale * rhs for scale in rhs_scales)
+    barrier = Barrier(len(rhs_scales))
+
+    def use(rhs_input):
+        barrier.wait()
+        output = cudss.solve(token, rhs_input).block_until_ready()
+        for _ in range(2):
+            output = cudss.solve(token, rhs_input).block_until_ready()
+        return output
+
+    with ThreadPoolExecutor(max_workers=len(rhs_scales)) as pool:
+        outputs = list(pool.map(use, rhs_inputs))
+
+    for index, rhs_scale in enumerate(rhs_scales):
+        output = outputs[index]
+        for i, matrix_scale in enumerate(np.asarray(scales_a)):
+            assert _rel_err(matrix_scale * A, output[i],
+                            rhs_scale * rhs[i]) < _TOL[jnp.float64]
+
+
 def test_release_then_self_heal():
     _require_gpu()
     values, offsets, columns, A = _sym_system()
@@ -1304,8 +1418,8 @@ def test_release_then_self_heal():
     token = cudss.factorize(cudss.analyze(values, offsets, columns), values)
     cudss.solve(token, b).block_until_ready()
 
-    assert cudss.release(token) is True
-    assert cudss.release(token) is False  # second release is a no-op
+    assert cudss.release(token)
+    assert not cudss.release(token)  # second release is a no-op
     # release frees the factors, not the token: the next solve rebuilds
     r0 = cudss.rebuild_count()
     x = cudss.solve(token, b)
@@ -1351,7 +1465,7 @@ def test_cudss_config_knobs():
         t = cudss.factorize(
             cudss.analyze(values, offsets, columns, reordering=alg), values)
         assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
-        lu[alg] = int(np.asarray(cudss.query(t)["lu_nnz"])[0])
+        lu[alg] = np.asarray(cudss.query(t)["lu_nnz"])[0].item()
     assert lu["none"] >= lu["default"]
 
     # hybrid host+device factors, evicted and healed with the same config
@@ -1361,7 +1475,7 @@ def test_cudss_config_knobs():
     for _ in range(cudss.cache_capacity()):
         cudss.analyze(values, offsets, columns).id.block_until_ready()
     assert _rel_err(A, cudss.solve(t, b), b) < _TOL[jnp.float64]
-    assert int(np.asarray(cudss.query(t)["lu_nnz"])[0]) == lu["none"]
+    assert np.asarray(cudss.query(t)["lu_nnz"])[0].item() == lu["none"]
 
     with pytest.raises(ValueError, match="unknown reordering"):
         cudss.analyze(values, offsets, columns, reordering="bogus")
@@ -1382,7 +1496,7 @@ def test_numeric_phases_rename():
     t_an = cudss.analyze(values, offsets, columns)
     t0 = cudss.factorize(t_an, values)
     t1 = cudss.refactorize(t0, 2.0 * values)
-    ids = {int(np.asarray(t.id)[0]) for t in (t_an, t0, t1)}
+    ids = {np.asarray(t.id)[0].item() for t in (t_an, t0, t1)}
     assert len(ids) == 3
 
     # t1 owns the entry; solving stale t0 rebuilds A's factors, not 2A's
@@ -1413,6 +1527,7 @@ def test_concurrent_refactors_branch_from_one_token():
     with ThreadPoolExecutor(max_workers=2) as pool:
         branches = list(pool.map(branch, (2.0, 3.0)))
 
-    for scale, result in zip((2.0, 3.0), branches):
+    for index, scale in enumerate((2.0, 3.0)):
+        result = branches[index]
         assert _rel_err(scale * A, cudss.solve(result, b), b) < _TOL[jnp.float64]
     assert _rel_err(A, cudss.solve(token, b), b) < _TOL[jnp.float64]
