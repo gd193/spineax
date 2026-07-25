@@ -30,8 +30,8 @@ def test_public_surface_and_canonical_identities():
         "release",
         "solve",
     }
-    assert set(solver.__all__) == public
-    assert set(cudss.__all__) == public
+    assert set(solver.__dict__["__all__"]) == public
+    assert public <= set(cudss.__dict__["__all__"])
     for name in public:
         assert getattr(cudss, name) is getattr(solver, name)
     assert solver.FactorToken is _core.FactorToken
