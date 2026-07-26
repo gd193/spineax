@@ -2,9 +2,8 @@
 
 ## Constant CSR cuDSS solver
 
-`cudss_constant_solver.py` measures the overhead of
-`ConstantCSRCuDSSSolver` against its equivalent explicit factor-once token API
-on symmetric positive-definite 2-D Laplacians.
+`cudss_constant_solver.py` measures the benefit and overhead of
+`ConstantCSRCuDSSSolver` on symmetric positive-definite 2-D Laplacians.
 
 ```bash
 CUDA_VISIBLE_DEVICES=1 python benchmarks/cudss_constant_solver.py \
@@ -14,24 +13,22 @@ CUDA_VISIBLE_DEVICES=1 python benchmarks/cudss_constant_solver.py \
   --output cudss-constant.json
 ```
 
-The benchmark reports paired, synchronized median latency for:
+The benchmark reports synchronized median latency for:
 
-- **const-setup**: owned CSR copies, analyze, and factorize;
-- **token-setup**: explicit analyze and factorize without wrapper-owned copies;
-- **const-solve**: solve through `ConstantCSRCuDSSSolver`;
-- **token-solve**: solve through the equivalent reused `FactorToken`;
-- **setup-oh / solve-oh**: wrapper overhead relative to the explicit token path.
+- **construct**: copy, analyze, and factorize a constant solver;
+- **constant**: solve through `ConstantCSRCuDSSSolver` with resident factors;
+- **token**: solve through an equivalent pre-factorized `FactorToken`;
+- **refactor**: analyze, factorize, solve, and release for every right-hand side;
+- **speedup**: `refactor / constant` median latency;
+- **wrapper**: constant-wrapper overhead relative to direct token solve.
 
-Both paths factor once and solve many times. The benchmark deliberately does
-not report a “speedup” against factorizing on every call: that would measure
-factorization avoidance already provided by the token API, not wrapper
-performance.
-
-JIT compilation and warmup are excluded, including when `--warmup=0`. Every
-timed operation is synchronized; the constant solver constructor blocks on its
-factor token internally. Paired method order alternates per sample, and all
-solve paths are checked against a known solution. Setup teardown occurs outside
-the timed interval.
+JIT compilation and warmup are excluded, including when `--warmup=0`. Each
+timed operation is synchronized, so results are observed operation latency
+rather than asynchronous dispatch throughput. Transient refactor tokens are
+released inside their timed lifecycle, and measurement order rotates between
+cases to reduce systematic thermal/clock bias. The harness verifies all three
+solve paths against a known solution and fails if the relative error exceeds
+the dtype tolerance.
 
 For stable results, use an otherwise idle GPU, pin `CUDA_VISIBLE_DEVICES`, and
 record the JSON output alongside the JAX, CUDA, cuDSS, and GPU versions.
