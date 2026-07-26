@@ -1,7 +1,5 @@
-# pyright: reportMissingImports=false
 """cuDSS-backed sparse direct solves for JAX (see spineax.cudss.solver)."""
 
-from spineax.cudss.constant import ConstantCSRCuDSSSolver
 from spineax.cudss.solver import (
     CSROperator,
     CuDSS,
@@ -20,7 +18,6 @@ from spineax.cudss.solver import (
 
 __all__ = [
     "CSROperator",
-    "ConstantCSRCuDSSSolver",
     "CuDSS",
     "FactorToken",
     "analyze",
