@@ -1317,6 +1317,7 @@ def test_failed_analyze_does_not_publish_state_and_retry_succeeds(monkeypatch):
     # simultaneously evicting an old entry while preserving the same size.
     monkeypatch.setenv("SPINEAX_FACTOR_CACHE", "64")
     size_before = cudss.registry_size()
+    assert size_before < cudss.cache_capacity()
 
     with pytest.raises(Exception, match="invalid reordering_id"):
         cudss.analyze(values, offsets, columns,
